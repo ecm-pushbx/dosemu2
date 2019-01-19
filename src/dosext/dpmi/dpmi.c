@@ -80,6 +80,11 @@ extern long int __sysconf (int); /* for Debian eglibc 2.13-3 */
  */
 #define EXC_TO_PM_INT 1
 
+#define lDEBUG_INT_FRAME_FUNC	0x2600
+
+static unsigned int pm_int_esp = 0;
+static unsigned short pm_int_ss = 0;
+
 #define D_16_32(reg)		(DPMI_CLIENT.is_32 ? reg : reg & 0xffff)
 #define ADD_16_32(acc, val)	{ if (DPMI_CLIENT.is_32) acc+=val; else LO_WORD(acc)+=val; }
 #define current_client ({ assert(in_dpmi); in_dpmi-1; })
@@ -1423,8 +1428,11 @@ static void get_ext_API(sigcontext_t *scp)
       D_printf("DPMI: GetVendorAPIEntryPoint: %s\n", ptr);
       if (!strcmp("VIRTUAL SUPPORT", ptr)) {
 	_LO(ax) = 0;
-      } else
-      if ((!strcmp("PHARLAP.HWINT_SUPPORT", ptr))||(!strcmp("PHARLAP.CE_SUPPORT", ptr))) {
+      } else if (!strcmp("lDebug interrupt stack frame", ptr)) {
+	_LO(ax) = 0;
+	_LWORD(edi) = lDEBUG_INT_FRAME_FUNC;
+	_HWORD(edi) = 0;
+      } else if ((!strcmp("PHARLAP.HWINT_SUPPORT", ptr))||(!strcmp("PHARLAP.CE_SUPPORT", ptr))) {
 	_LO(ax) = 0;
       } else if (!strcmp("THUNK_16_32", ptr)) {
 	_LO(ax) = 0;
@@ -2463,6 +2471,12 @@ err:
     }
     break;
 
+  case lDEBUG_INT_FRAME_FUNC: {
+      _ebx = pm_int_esp;
+      _ecx = pm_int_ss;
+    }
+    break;
+
   default:
     D_printf("DPMI: unimplemented int31 func %#x\n",_LWORD(eax));
     _eflags |= CF;
@@ -2848,6 +2862,13 @@ void run_pm_int(int i)
   D_printf("DPMI: Calling protected mode handler for int 0x%02x\n", i);
   if (DPMI_CLIENT.is_32) {
     unsigned int *ssp = sp;
+    *--ssp = 0;
+    *--ssp = pm_int_ss;
+    *--ssp = pm_int_esp;
+    *--ssp = SREG(ss);
+    *--ssp = REG(esp);
+    *--ssp = SREG(cs);
+    *--ssp = REG(eip);
     *--ssp = imr;
     *--ssp = 0;	/* reserved */
     *--ssp = in_dpmi_pm();
@@ -2858,9 +2879,18 @@ void run_pm_int(int i)
     *--ssp = get_vFLAGS(_eflags);
     *--ssp = dpmi_sel();
     *--ssp = DPMI_SEL_OFF(DPMI_return_from_pm);
-    _esp -= 40;
+    _esp -= 40 + 4*7;
+    pm_int_esp = _esp;
+    pm_int_ss = _ss;
   } else {
     unsigned short *ssp = sp;
+    *--ssp = pm_int_esp >> 16;
+    *--ssp = pm_int_ss;
+    *--ssp = pm_int_esp & 0xFFFF;
+    *--ssp = SREG(ss);
+    *--ssp = LWORD(esp);
+    *--ssp = SREG(cs);
+    *--ssp = LWORD(eip);
     *--ssp = imr;
     /* store the high word of ESP, because CPU corrupts it */
     *--ssp = HI_WORD(old_esp);
@@ -2872,7 +2902,9 @@ void run_pm_int(int i)
     *--ssp = (unsigned short) get_vFLAGS(_eflags);
     *--ssp = dpmi_sel();
     *--ssp = DPMI_SEL_OFF(DPMI_return_from_pm);
-    LO_WORD(_esp) -= 20;
+    LO_WORD(_esp) -= 20 + 2*7;
+    pm_int_esp = _esp;
+    pm_int_ss = _ss;
   }
   _cs = DPMI_CLIENT.Interrupt_Table[i].selector;
   _eip = DPMI_CLIENT.Interrupt_Table[i].offset;
@@ -3847,7 +3879,15 @@ static int dpmi_fault1(sigcontext_t *scp)
 	    dpmi_set_pm(*ssp++);
 	    ssp++;
 	    imr = *ssp++;
+	    REG(eip) = *ssp++;
+	    SREG(cs) = *ssp++;
+	    REG(esp) = *ssp++;
+	    SREG(ss) = *ssp++;
+	    pm_int_esp = *ssp++;
+	    pm_int_ss = *ssp++;
+	    ssp++;
 	  } else {
+	    unsigned int old_pm_int_esp;
 	    unsigned short *ssp = sp;
 	    _LWORD(eip) = *ssp++;
 	    _cs = *ssp++;
@@ -3856,6 +3896,14 @@ static int dpmi_fault1(sigcontext_t *scp)
 	    dpmi_set_pm(*ssp++);
 	    _HWORD(esp) = *ssp++;
 	    imr = *ssp++;
+	    LWORD(eip) = *ssp++;
+	    SREG(cs) = *ssp++;
+	    LWORD(esp) = *ssp++;
+	    SREG(ss) = *ssp++;
+	    old_pm_int_esp = *ssp++;
+	    pm_int_ss = *ssp++;
+	    old_pm_int_esp |= (*ssp++) << 16;
+	    pm_int_esp = old_pm_int_esp;
 	  }
 	  in_dpmi_irq--;
 	  port_outb(0x21, imr);
