@@ -87,12 +87,6 @@ static __inline__ void SetCPU_WL(int m, char o, unsigned long v)
 
 #define UNPREFIX(m)	((m)&~(DATA16|ADDR16))|(basemode&(DATA16|ADDR16))
 
-#if 1	// VIF kernel patch
-#define EFLAGS_IFK	(EFLAGS_IF|EFLAGS_VIF)
-#else
-#define EFLAGS_IFK	EFLAGS_IF
-#endif
-
 /////////////////////////////////////////////////////////////////////////////
 
 
@@ -141,12 +135,11 @@ static int _MAKESEG(int mode, int *basemode, int ofs, unsigned short sv)
 //	link	7x 06 e9 l l l l -- -- e9 l l l l -- --
 //
 
-static unsigned int _JumpGen(unsigned int P2, int mode, int cond,
-			      int btype, unsigned int *r_P0)
+static unsigned int _JumpGen(unsigned int P2, int mode, int opc,
+			      int pskip, unsigned int *r_P0)
 {
 	unsigned int P1;
 	int dsp;
-	int pskip;
 	unsigned int d_t, d_nt, j_t, j_nt;
 
 	/* pskip points to start of next instruction
@@ -156,35 +149,42 @@ static unsigned int _JumpGen(unsigned int P2, int mode, int cond,
 	 *	eb ff	dsp=1	illegal or tricky
 	 *	eb fe	dsp=0	loop forever
 	 */
-	if ((btype&5)==0) {	// short branch (byte)
-		pskip = 2;
-		dsp = pskip + (signed char)Fetch(P2+1);
+	if ((opc>>8) == GRP2wrm) {	// indirect jump
+		dsp = 0;
 	}
-	else if ((btype&5)==4) {	// jmp (word/long)
-		pskip = 1 + BT24(BitDATA16,mode);
-		dsp = pskip + (int)DataFetchWL_S(mode, P2+1);
+	else if (opc == JMPld || opc == CALLl) { // far jmp/call
+		d_t = DataFetchWL_U(mode, P2+1);
+		j_t = SEGOFF2LINEAR(FetchW(P2 + pskip - 2), d_t);
+		dsp = j_t - P2;
 	}
-	else {		// long branch (word/long)
-		pskip = 2 + BT24(BitDATA16,mode);
-		dsp = pskip + (int)DataFetchWL_S(mode, P2+2);
+	else {
+		dsp = pskip;
+		if (pskip == 2)	// short branch (byte)
+			dsp += (signed char)Fetch(P2+1);
+		else		// long branch (word/long)
+			dsp += (int)DataFetchWL_S(mode,
+				P2+pskip-BT24(BitDATA16,mode));
+
+		/* displacement for taken branch */
+		d_t  = P2 - LONG_CS + dsp;
+		if (mode&DATA16) d_t &= 0xffff;
+
+		/* jump address for taken branch */
+		j_t  = d_t  + LONG_CS;
 	}
 
-	/* displacement for taken branch */
-	d_t  = P2 - LONG_CS + dsp;
 	/* displacement for not taken branch */
 	d_nt = P2 - LONG_CS + pskip;
-	if (mode&DATA16) { d_t &= 0xffff; d_nt &= 0xffff; }
+	if (mode&DATA16) d_nt &= 0xffff;
 
-	/* jump address for taken branch */
-	j_t  = d_t  + LONG_CS;
 	/* jump address for not taken branch, usually next instruction */
 	j_nt = d_nt + LONG_CS;
 	*r_P0 = j_nt;
 
 	P1 = P2 + pskip;
-	switch(cond) {
-	case 0x00 ... 0x0f:
-	case 0x31:
+	switch(opc) {
+	case JO ... JNLE_JG:
+	case JCXZ:
 		if (dsp < 0) mode |= CKSIGN;
 		/* is there a jump after the condition? if yes, simplify */
 #if !defined(SINGLESTEP)
@@ -217,20 +217,20 @@ static unsigned int _JumpGen(unsigned int P2, int mode, int cond,
 		    if (dsp >= 0) {
 			// dsp>0 && dsp<pskip: jumps in the jmp itself
 			if (dsp > 0)
-			    e_printf("### self jmp=%x dsp=%d pskip=%d\n",cond,dsp,pskip);
+			    e_printf("### self jmp=%x dsp=%d pskip=%d\n",opc,dsp,pskip);
 			else // dsp==0
 			    /* strange but possible, very tight loop with an external
 			     * condition changing a flag */
-			    e_printf("### dsp=0 jmp=%x pskip=%d\n",cond,pskip);
+			    e_printf("### dsp=0 jmp=%x pskip=%d\n",opc,pskip);
 		    }
 		    if (CONFIG_CPUSIM)
-			Gen(JB_LINK, mode, cond, P2, j_t, j_nt);
+			Gen(JB_LINK, mode, opc, P2, j_t, j_nt);
 		    else
-			Gen(JB_LINK, mode, cond, P2, j_t, j_nt, &InstrMeta[0].clink);
+			Gen(JB_LINK, mode, opc, P2, j_t, j_nt, &InstrMeta[0].clink);
 		}
 		else {
 		    if (dsp == pskip) {
-			e_printf("### jmp %x 00\n",cond);
+			e_printf("### jmp %x 00\n",opc);
 #if !defined(SINGLESTEP)
 			if (CONFIG_CPUSIM && !(EFLAGS & TF)) {
 			    TheCPU.mode |= SKIPOP;
@@ -241,39 +241,56 @@ static unsigned int _JumpGen(unsigned int P2, int mode, int cond,
 		    }
 		    /* forward jump or backward jump >=256 bytes */
 		    if (CONFIG_CPUSIM)
-			Gen(JF_LINK, mode, cond, P2, j_t, j_nt);
+			Gen(JF_LINK, mode, opc, P2, j_t, j_nt);
 		    else
-			Gen(JF_LINK, mode, cond, P2, j_t, j_nt, &InstrMeta[0].clink);
+			Gen(JF_LINK, mode, opc, P2, j_t, j_nt, &InstrMeta[0].clink);
 		}
 		break;
-	case 0x10:
+	case JMPld: {   /* uncond jmp far */
+		unsigned short jcs = FetchW(P2 + pskip - 2);
+		Gen(L_IMM, mode, Ofs_CS, jcs);
+		AddrGen(A_SR_SH4, mode, Ofs_CS, Ofs_XCS);
+	}
+	/* no break */
+	case JMPsid: case JMPd:   /* uncond jmp */
 		if (dsp==0) {	// eb fe
 		    dbug_printf("!Forever loop!\n");
 		    leavedos_main(0xebfe);
 		}
 #if !defined(SINGLESTEP)
-		if (CONFIG_CPUSIM && !(EFLAGS & TF) &&
-		    ((P2 ^ j_t) & PAGE_MASK)==0) {	// same page
+		if (CONFIG_CPUSIM && !(EFLAGS & TF) && opc != JMPld) {
 		    if (debug_level('e')>1) dbug_printf("** JMP: ignored\n");
 		    TheCPU.mode |= SKIPOP;
 		    TheCPU.eip = d_t;
 		    return j_t;
 		}
 #endif
-	if (dsp < 0) mode |= CKSIGN;
-	/* no break */
-	case 0x11:    /* call, unfortunately also uses JMP_LINK */
+		if (dsp < 0) mode |= CKSIGN;
 		if (CONFIG_CPUSIM)
-		    Gen(JMP_LINK, mode, cond, j_t, d_nt);
+		    Gen(JMP_LINK, mode, opc, j_t, d_nt);
 		else
-		    Gen(JMP_LINK, mode, cond, j_t, d_nt, &InstrMeta[0].clink);
+		    Gen(JMP_LINK, mode, opc, j_t, d_nt, &InstrMeta[0].clink);
 		break;
-	case 0x20: case 0x24: case 0x25:
+	case CALLl: {   /* call far */
+		unsigned short jcs = FetchW(P2 + pskip - 2);
+		Gen(L_REG, mode, Ofs_CS);
+		Gen(O_PUSH, mode);
+		Gen(L_IMM, mode, Ofs_CS, jcs);
+		AddrGen(A_SR_SH4, mode, Ofs_CS, Ofs_XCS);
+	}
+	/* no break */
+	case CALLd:    /* call, unfortunately also uses JMP_LINK */
+		if (CONFIG_CPUSIM)
+		    Gen(JMP_LINK, mode, opc, j_t, d_nt);
+		else
+		    Gen(JMP_LINK, mode, opc, j_t, d_nt, &InstrMeta[0].clink);
+		break;
+	case LOOP: case LOOPZ_LOOPE: case LOOPNZ_LOOPNE:
 		if (dsp == 0) {
 #if !defined(SINGLESTEP)
 		    if (CONFIG_CPUSIM && !(EFLAGS & TF)) {
 		    	// ndiags: shorten delay loops (e2 fe)
-			e_printf("### loop %x 0xfe\n",cond);
+			e_printf("### loop %x 0xfe\n",opc);
 			Gen(L_IMM, ((mode&ADDR16) ? (mode|DATA16) : mode),
 			    Ofs_ECX, 0);
 			TheCPU.eip = d_nt;
@@ -282,9 +299,20 @@ static unsigned int _JumpGen(unsigned int P2, int mode, int cond,
 #endif
 		}
 		if (CONFIG_CPUSIM)
-		    Gen(JLOOP_LINK, mode, cond, j_t, j_nt);
+		    Gen(JLOOP_LINK, mode, opc, j_t, j_nt);
 		else
-		    Gen(JLOOP_LINK, mode, cond, j_t, j_nt, &InstrMeta[0].clink);
+		    Gen(JLOOP_LINK, mode, opc, j_t, j_nt, &InstrMeta[0].clink);
+		break;
+	case RETl: case RETlisp: case JMPli: case CALLli: // far ret, indirect
+		Gen(S_REG, mode, Ofs_CS);
+		AddrGen(A_SR_SH4, mode, Ofs_CS, Ofs_XCS);
+		Gen(L_REG, mode, Ofs_EIP);
+		/* fall through */
+	case RET: case RETisp: case JMPi: case CALLi: // ret, indirect
+		if (CONFIG_CPUSIM)
+			Gen(JMP_INDIRECT, mode);
+		else
+			Gen(JMP_INDIRECT, mode, &InstrMeta[0].clink);
 		break;
 	default: dbug_printf("JumpGen: unknown condition\n");
 		break;
@@ -293,10 +321,10 @@ static unsigned int _JumpGen(unsigned int P2, int mode, int cond,
 	return (unsigned)-1;
 }
 
-#define JumpGen(P2, mode, cond, btype) ({ \
+#define JumpGen(P2, mode, opc, pskip) ({ \
 	unsigned int _P0, _P1; \
 	int _rc; \
-	_P1 = _JumpGen(P2, mode, cond, btype, &_P0); \
+	_P1 = _JumpGen(P2, mode, opc, pskip, &_P0); \
 	if (_P1 == (unsigned)-1) { \
 		if (!CONFIG_CPUSIM) \
 			NewIMeta(P2, mode, &_rc); \
@@ -617,13 +645,14 @@ intop3b:		{ int op = ArOpsFR[D_MO(opc)];
 			    else CODE_FLUSH();
 #endif
 			    /* virtual-8086 monitor */
-			    temp = EFLAGS & 0xdff;
-			    if (eVEFLAGS & VIF) temp |= EFLAGS_IF;
-			    temp |= (IOPL_MASK|eVEFLAGS) & eTSSMASK;
+			    if (!(TheCPU.cr[4] & CR4_VME))
+				goto not_permitted;	/* GPF */
+			    temp = (EFLAGS|IOPL_MASK) & RETURN_MASK;
+			    if (EFLAGS & VIF) temp |= EFLAGS_IF;
 			    PUSH(mode, temp);
 			    if (debug_level('e')>1)
-				e_printf("Pushed flags %08x fl=%08x vf=%08x\n",
-		    			temp,EFLAGS,eVEFLAGS);
+				e_printf("Pushed flags %08x fl=%08x\n",
+					temp,EFLAGS);
 			}
 			else {
 				Gen(O_PUSH2F, mode);
@@ -968,34 +997,13 @@ intop3b:		{ int op = ArOpsFR[D_MO(opc)];
 /*7c*/	case JL_JNGE:
 /*7d*/	case JNL_JGE:
 /*7e*/	case JLE_JNG:
-/*7f*/	case JNLE_JG:   {
-			  PC = JumpGen(PC, mode, (opc-JO), 0);
-			  if (TheCPU.err) return PC;
-			}
-			break;
-/*eb*/	case JMPsid:    {
-			  PC = JumpGen(PC, mode, 0x10, 0);
-			  if (TheCPU.err) return PC;
-			}
-			break;
-
-/*e0*/	case LOOPNZ_LOOPNE: {
-			  PC = JumpGen(PC, mode, 0x25, 2);
-			  if (TheCPU.err) return PC;
-			}
-			break;
-/*e1*/	case LOOPZ_LOOPE: {
-			  PC = JumpGen(PC, mode, 0x24, 2);
-			  if (TheCPU.err) return PC;
-			}
-			break;
-/*e2*/	case LOOP:	{
-			  PC = JumpGen(PC, mode, 0x20, 2);
-			  if (TheCPU.err) return PC;
-			}
-			break;
+/*7f*/	case JNLE_JG:
+/*eb*/	case JMPsid:
+/*e0*/	case LOOPNZ_LOOPNE:
+/*e1*/	case LOOPZ_LOOPE:
+/*e2*/	case LOOP:
 /*e3*/	case JCXZ:	{
-			  PC = JumpGen(PC, mode, 0x31, 2);
+			  PC = JumpGen(PC, mode, opc, 2);
 			  if (TheCPU.err) return PC;
 			}
 			break;
@@ -1492,19 +1500,29 @@ intop3b:		{ int op = ArOpsFR[D_MO(opc)];
 		}
 		break;
 
-/*e9*/	case JMPd: {
-			PC = JumpGen(PC, mode, 0x10, 4);
-			if (TheCPU.err) return PC;
-		   }
-		   break;
-/*e8*/	case CALLd: {
-			PC = JumpGen(PC, mode, 0x11, 4);
-			if (TheCPU.err) return PC;
-		   }
-		   break;
+/*e9*/	case JMPd:
+/*e8*/	case CALLd:
+		    PC = JumpGen(PC, mode, opc, 1 + BT24(BitDATA16,mode));
+		    if (TheCPU.err) return PC;
+		    break;
 
 /*9a*/	case CALLl:
-/*ea*/	case JMPld: {
+/*ea*/	case JMPld:
+		    if (REALADDR()) {
+			int len = 3 + BT24(BitDATA16,mode);
+			dosaddr_t oip = PC + len - LONG_CS;
+			ocs = TheCPU.cs;
+			PC = JumpGen(PC, mode, opc, len);
+			if (debug_level('e')>2) {
+			    if (opc==CALLl)
+				e_printf("CALL_FAR: ret=%04x:%08x\n  calling:	   %04x:%08x\n",
+					 ocs,oip,TheCPU.cs,PC-LONG_CS);
+			    else
+				e_printf("JMP_FAR: %04x:%08x\n",TheCPU.cs,PC-LONG_CS);
+			}
+			if (TheCPU.err) return PC;
+		    }
+		    else {
 			unsigned short jcs;
 			unsigned long oip,xcs,jip=0;
 			CODE_FLUSH();
@@ -1548,21 +1566,18 @@ intop3b:		{ int op = ArOpsFR[D_MO(opc)];
 			break;
 
 /*c2*/	case RETisp: {
-			int dr;
-			CODE_FLUSH();
-			dr = (signed short)FetchW(PC+1);
-			POP(mode, &TheCPU.eip);
+			int dr = (signed short)FetchW(PC+1);
+			Gen(O_POP, mode|MRETISP, dr);
+			PC = JumpGen(PC, mode, opc, 3);
 			if (debug_level('e')>2)
-				e_printf("RET: ret=%08x inc_sp=%d\n",TheCPU.eip,dr);
-			temp = rESP + dr;
-			rESP = (temp&TheCPU.StackMask) | (rESP&~TheCPU.StackMask);
-			PC = LONG_CS + TheCPU.eip; }
+				e_printf("RET: ret=%08x inc_sp=%d\n",PC-LONG_CS,dr);
+			if (TheCPU.err) return PC; }
 			break;
 /*c3*/	case RET:
-			CODE_FLUSH();
-			POP(mode, &TheCPU.eip);
-			if (debug_level('e')>2) e_printf("RET: ret=%08x\n",TheCPU.eip);
-			PC = LONG_CS + TheCPU.eip;
+			Gen(O_POP, mode);
+			PC = JumpGen(PC, mode, opc, 1);
+			if (debug_level('e')>2) e_printf("RET: ret=%08x\n",PC-LONG_CS);
+			if (TheCPU.err) return PC;
 			break;
 /*c6*/	case MOVbirm:
 			PC += ModRM(opc, PC, mode|MBYTE);
@@ -1582,14 +1597,35 @@ intop3b:		{ int op = ArOpsFR[D_MO(opc)];
 /*c8*/	case ENTER: {
 			unsigned int sp, bp, frm;
 			int level, ds;
-			CODE_FLUSH();
 			level = Fetch(PC+3) & 0x1f;
-			ds = BT24(BitDATA16, mode);
-			sp = LONG_SS + ((rESP - ds) & TheCPU.StackMask);
-			bp = LONG_SS + (rEBP & TheCPU.StackMask);
-			PUSH(mode, rEBP);
-			frm = sp - LONG_SS;
-			if (level) {
+			if (level <= 1) {
+				int allocsize = FetchW(PC+1);
+				Gen(L_REG, mode, Ofs_EBP);
+				Gen(O_PUSH, mode);
+				if (level == 1) {
+					Gen(L_REG, mode, Ofs_ESP);
+					Gen(O_PUSH, mode);
+					Gen(S_REG, mode, Ofs_EBP);
+				}
+				else {
+					Gen(L_REG2REG, mode, Ofs_ESP, Ofs_EBP);
+				}
+				// subtract AllocSize from ESP via
+				// "lea -allocsize(%esp), %esp"
+				if (allocsize) {
+					AddrGen(A_DI_1, 0,
+						mode|MLEA|((mode&DATA16)?ADDR16:0)|IMMED,
+						-allocsize, Ofs_ESP);
+					Gen(S_DI_R, mode, Ofs_ESP);
+				}
+			}
+			else {
+				CODE_FLUSH();
+				ds = BT24(BitDATA16, mode);
+				sp = LONG_SS + ((rESP - ds) & TheCPU.StackMask);
+				bp = LONG_SS + (rEBP & TheCPU.StackMask);
+				PUSH(mode, rEBP);
+				frm = sp - LONG_SS;
 				sp -= ds*level;
 				while (--level) {
 					bp -= ds;
@@ -1597,17 +1633,28 @@ intop3b:		{ int op = ArOpsFR[D_MO(opc)];
 					     READ_WORD(bp) : READ_DWORD(bp));
 				}
 				PUSH(mode, frm);
+				if (mode&DATA16) rBP = frm; else rEBP = frm;
+				sp -= FetchW(PC+1);
+				temp = sp - LONG_SS;
+				rESP = (temp&TheCPU.StackMask) | (rESP&~TheCPU.StackMask);
 			}
-			if (mode&DATA16) rBP = frm; else rEBP = frm;
-			sp -= FetchW(PC+1);
-			temp = sp - LONG_SS;
-			rESP = (temp&TheCPU.StackMask) | (rESP&~TheCPU.StackMask);
 			PC += 4; }
 			break;
 /*c9*/	case LEAVE:
 			Gen(O_LEAVE, mode); PC++;
 			break;
-/*ca*/	case RETlisp: { /* restartable */
+/*ca*/	case RETlisp:
+			if (REALADDR()) {
+				int dr = (signed short)FetchW(PC+1);
+				Gen(O_POP, mode);
+				Gen(S_REG, mode, Ofs_EIP);
+				Gen(O_POP, mode|MRETISP, dr);
+				PC = JumpGen(PC, mode, opc, 3);
+				if (debug_level('e')>2)
+					e_printf("RET_%d: ret=%08x\n",dr,TheCPU.eip);
+				if (TheCPU.err) return PC;
+			}
+			else { /* restartable */
 			unsigned long dr;
 			uint16_t sv=0;
 			CODE_FLUSH();
@@ -1646,7 +1693,36 @@ intop3b:		{ int op = ArOpsFR[D_MO(opc)];
 #ifdef ASM_DUMP
 			fprintf(aLog,"%08x:\t\tint %02x\n", P0, inum);
 #endif
-			switch(inum) {
+			// V86: always #GP(0) if revectored or without VME
+			if (V86MODE() && !(TheCPU.cr[4] & CR4_VME) && IOPL<3)
+				goto not_permitted;
+			if (V86MODE() && (TheCPU.cr[4] & CR4_VME) &&
+			    !is_revectored(inum, &vm86s.int_revectored)) {
+				uint32_t segoffs;
+				segoffs = read_dword(inum << 2);
+				if (CONFIG_CPUSIM) FlagSync_All();
+				temp = (EFLAGS|IOPL_MASK) & (RETURN_MASK|EFLAGS_IF);
+				if (IOPL<3) {
+					temp &= ~EFLAGS_IF;
+					if (EFLAGS & VIF)
+						temp |= EFLAGS_IF;
+				}
+				PUSH(mode, temp);
+				PUSH(mode, TheCPU.cs);
+				PUSH(mode, PC + 2 - LONG_CS);
+				TheCPU.err = MAKESEG(mode, Ofs_CS, segoffs >> 16);
+				if (TheCPU.err) return P0;
+				TheCPU.eip = segoffs & 0xffff;
+				PC = LONG_CS + TheCPU.eip;
+				EFLAGS &= ~(TF|RF|AC|NT);
+				EFLAGS &= ~(IOPL==3 ? EFLAGS_IF : EFLAGS_VIF);
+				if (debug_level('e')>1)
+					dbug_printf("EMU86: directly calling int %#x ax=%#x at %#x:%#x\n",
+						    inum, _AX, _CS, _IP);
+				break;
+			}
+			/* protected mode INT or revectored V86 with IOPL=3 */
+			if (PROTMODE()) switch(inum) {
 			case 0x03:
 				TheCPU.err=EXCP03_INT3;
 				PC += 2;
@@ -1665,6 +1741,17 @@ intop3b:		{ int op = ArOpsFR[D_MO(opc)];
 		}
 
 /*cb*/	case RETl:
+		   if (REALADDR()) {
+			Gen(O_POP, mode);
+			Gen(S_REG, mode, Ofs_EIP);
+			Gen(O_POP, mode);
+			PC = JumpGen(PC, mode, opc, 1);
+			if (debug_level('e')>1)
+			    e_printf("RET_FAR: ret=%04x:%08x\n",TheCPU.cs,TheCPU.eip);
+			if (TheCPU.err) return PC;
+			break;	/* un-fall */
+		   }
+		   /* fall through */
 /*cf*/	case IRET: {	/* restartable */
 			uint16_t sv=0;
 			int m = mode;
@@ -1711,32 +1798,40 @@ intop3b:		{ int op = ArOpsFR[D_MO(opc)];
 			temp=0; POP(mode, &temp);
 			if (CONFIG_CPUSIM) RFL.valid = V_INVALID;
 			if (V86MODE()) {
+			    int is_tf;
 stack_return_from_vm86:
 			    if (debug_level('e')>1)
-				e_printf("Popped flags %08x fl=%08x vf=%08x\n",
-					temp,EFLAGS,eVEFLAGS);
+				e_printf("Popped flags %08x fl=%08x\n",
+					temp,EFLAGS);
+			    is_tf = !!(EFLAGS & TF);
 			    if (IOPL==3) {	/* Intel manual */
+				/* keep reserved bits + IOPL,VIP,VIF,VM,RF */
 				if (mode & DATA16)
-				    FLAGS = temp;	/* oh,really? */
+				    FLAGS &= ~(SAFE_MASK|EFLAGS_IF);
 				else
-				    EFLAGS = (temp&~0x1b3000) | (EFLAGS&0x1b3000);
+				    EFLAGS &= ~(SAFE_MASK|EFLAGS_IF);
+				EFLAGS |= temp & (SAFE_MASK|EFLAGS_IF);
 			    }
 			    else {
-				int is_tf = !!(EFLAGS & TF);
 				/* virtual-8086 monitor */
-				/* move TSSMASK from pop{e}flags to V{E}FLAGS */
-				eVEFLAGS = (eVEFLAGS & ~eTSSMASK) | (temp & eTSSMASK);
-				/* move 0xdd5 from pop{e}flags to regs->eflags */
-				EFLAGS = (EFLAGS & ~0xdd5) | (temp & 0xdd5);
-				if (temp & EFLAGS_IF) {
-				    eVEFLAGS |= EFLAGS_VIF;
-				    if (vm86s.regs.eflags & VIP) {
-					if (debug_level('e')>1)
-					    e_printf("Return for STI fl=%08x vf=%08x\n",
-						EFLAGS,eVEFLAGS);
-					TheCPU.err = (is_tf ? EXCP01_SSTP : EXCP_STISIGNAL);
-					return PC + (opc==POPF);
-				    }
+				if (!(TheCPU.cr[4] & CR4_VME))
+				    goto not_permitted;	/* GPF */
+				/* move mask from pop{e}flags to regs->eflags */
+				if (mode & DATA16)
+				    FLAGS &= ~SAFE_MASK;
+				else
+				    EFLAGS &= ~SAFE_MASK;
+				EFLAGS |= temp & SAFE_MASK;
+				if (temp & EFLAGS_IF)
+				    EFLAGS |= EFLAGS_VIF;
+			    }
+			    if (temp & EFLAGS_IF) {
+				if (vm86s.regs.eflags & VIP) {
+				    if (debug_level('e')>1)
+					e_printf("Return for STI fl=%08x\n",
+						 EFLAGS);
+				    TheCPU.err = (is_tf ? EXCP01_SSTP : EXCP_STISIGNAL);
+				    return PC + (opc==POPF);
 				}
 			    }
 			}
@@ -1749,13 +1844,15 @@ stack_return_from_vm86:
 			    else
 				EFLAGS = (EFLAGS&amask) |
 					 ((temp&(eTSSMASK|0xfd7))&~amask);
-//			    if (in_dpmi) {
+			    // unused "extended PVI" since real PVI does not
+			    // affect POPF
+			    if (IOPL<3 && (TheCPU.cr[4]&CR4_PVI)) {
 				if (temp & EFLAGS_IF)
 				    set_IF();
 				else {
 				    clear_IF();
 				}
-//			    }
+			    }
 			    if (debug_level('e')>1)
 				e_printf("Popped flags %08x->{r=%08x v=%08x}\n",temp,EFLAGS,_EFLAGS);
 			}
@@ -2059,22 +2156,26 @@ repag0:
 				Gen(O_SETFL, mode, STC);
 			break;
 /*fa*/	case CLI:
-			CODE_FLUSH();
 			if (REALMODE() || (CPL <= IOPL) || (IOPL==3)) {
-				EFLAGS &= ~EFLAGS_IF;
+				Gen(O_SETFL, mode, CLI);
 			}
 			else {
+			    CODE_FLUSH();
 			    /* virtual-8086 monitor */
 			    if (V86MODE()) {
 				if (debug_level('e')>2) e_printf("Virtual VM86 CLI\n");
-				eVEFLAGS &= ~EFLAGS_VIF;
+				if (TheCPU.cr[4] & CR4_VME)
+				    EFLAGS &= ~EFLAGS_VIF;
+				else
+				    goto not_permitted;	/* GPF */
 			    }
-			    else/* if (in_dpmi)*/ {
+			    else if (TheCPU.cr[4] & CR4_PVI) {
+				CODE_FLUSH();
 				if (debug_level('e')>2) e_printf("Virtual DPMI CLI\n");
 				clear_IF();
 			    }
-//			    else
-//				goto not_permitted;	/* GPF */
+			    else
+				goto not_permitted;	/* GPF */
 			}
 			PC++;
 			break;
@@ -2083,11 +2184,16 @@ repag0:
 			if (V86MODE()) {    /* traps always (Intel man) */
 				/* virtual-8086 monitor */
 				if (debug_level('e')>2) e_printf("Virtual VM86 STI\n");
-				eVEFLAGS |= EFLAGS_VIF;
+				if (IOPL==3)
+				    EFLAGS |= EFLAGS_IF;
+				else if (TheCPU.cr[4]&CR4_VME)
+				    EFLAGS |= EFLAGS_VIF;
+				else
+				    goto not_permitted;	/* GPF */
 				if (vm86s.regs.eflags & VIP) {
 				    if (debug_level('e')>1)
-					e_printf("Return for STI fl=%08x vf=%08x\n",
-			    		    EFLAGS,eVEFLAGS);
+					e_printf("Return for STI fl=%08x\n",
+					    EFLAGS);
 				    TheCPU.err=EXCP_STISIGNAL;
 				    return PC+1;
 				}
@@ -2096,12 +2202,12 @@ repag0:
 			    if (REALMODE() || (CPL <= IOPL) || (IOPL==3)) {
 				EFLAGS |= EFLAGS_IF;
 			    }
-			    else/* if (in_dpmi)*/ {
+			    else if (TheCPU.cr[4] & CR4_PVI) {
 				if (debug_level('e')>2) e_printf("Virtual DPMI STI\n");
 				set_IF();
 			    }
-//			    else
-//				goto not_permitted;	/* GPF */
+			    else
+				goto not_permitted;	/* GPF */
 			}
 			PC++;
 			break;
@@ -2181,33 +2287,67 @@ repag0:
 				Gen(S_DI, mode);
 				break;
 			case Ofs_SP:	/*4*/	 // JMP near indirect
+				PC = JumpGen(PC, mode, (opc<<8)|REG1,
+					ModRM(opc, PC, mode|NOFLDR|MLOAD));
+				if (TheCPU.err) return PC;
+				break;
 			case Ofs_DX: {	/*2*/	 // CALL near indirect
-					int dp;
-					CODE_FLUSH();
-					PC += ModRMSim(PC, mode|NOFLDR);
-					TheCPU.eip = PC - LONG_CS;
-					if (TheCPU.mode & RM_REG) {
-						dp = GetCPU_WL(mode, REG3);
-					} else {
-						dp = DataGetWL_U(mode, TheCPU.mem_ref);
-					}
-					if (REG1==Ofs_DX) {
-						PUSH(mode, TheCPU.eip);
-						if (debug_level('e')>2)
-							e_printf("CALL indirect: ret=%08x\n\tcalling: %08x\n",
-								TheCPU.eip,dp);
-					}
-					PC = LONG_CS + dp;
+				/* don't use MLOAD as O_PUSHI clobbers eax */
+				int len = ModRM(opc, PC, mode|NOFLDR);
+				dosaddr_t ret = PC + len - LONG_CS;
+				Gen(O_PUSHI, mode, ret);
+				if (TheCPU.mode & RM_REG)
+					Gen(L_REG, mode, REG3);
+				else
+					Gen(L_DI_R1, mode);
+				PC = JumpGen(PC, mode, (opc<<8)|REG1, len);
+				if (debug_level('e')>2)
+					e_printf("CALL indirect: ret=%08x\n\tcalling: %08x\n",
+						 ret,PC-LONG_CS);
+				if (TheCPU.err) return PC;
 				}
 				break;
 			case Ofs_BX:	/*3*/	 // CALL long indirect restartable
-			case Ofs_BP: {	/*5*/	 // JMP long indirect restartable
+			case Ofs_BP:	/*5*/	 // JMP long indirect restartable
+				if (Fetch(PC+1) >= 0xc0) {
+					CODE_FLUSH();
+					goto illegal_op;
+				}
+				if (REALADDR()) {
+					dosaddr_t oip = 0;
+					int len = ModRM(opc, PC, mode|NOFLDR);
+					if (REG1==Ofs_BX) {
+					    /* ok, now push old cs:eip */
+					    ocs = TheCPU.cs;
+					    oip = PC + len - LONG_CS;
+					    Gen(L_REG, mode, Ofs_CS);
+					    Gen(O_PUSH, mode);
+					    Gen(O_PUSHI, mode, oip);
+					}
+					Gen(L_LXS1, mode, Ofs_EIP);
+					Gen(L_DI_R1, mode);
+					PC = JumpGen(PC, mode, (opc<<8)|REG1, len);
+					if (debug_level('e')>2) {
+					    unsigned short jcs = TheCPU.cs;
+					    dosaddr_t jip = PC - LONG_CS;
+					    if (REG1==Ofs_BX)
+						e_printf("CALL_FAR indirect: ret=%04x:%08x\n\tcalling: %04x:%08x\n",
+							 ocs,oip,jcs,jip);
+					    else
+						e_printf("JMP_FAR indirect: %04x:%08x\n",jcs,jip);
+					}
+#ifdef SKIP_EMU_VBIOS
+					if ((jcs&0xf000)==config.vbios_seg) {
+					    /* return the new PC after the jump */
+					    TheCPU.err = EXCP_GOBACK;
+					}
+#endif
+					if (TheCPU.err) return PC;
+				}
+				else {
 					unsigned short jcs;
 					unsigned long oip,xcs,jip=0;
 					CODE_FLUSH();
-					if (Fetch(PC+1) >= 0xc0) {
-						goto illegal_op;
-					}
 					PC += ModRMSim(PC, mode|NOFLDR);
 					TheCPU.eip = PC - LONG_CS;
 					/* get new cs:ip */
@@ -2238,12 +2378,6 @@ repag0:
 					}
 					TheCPU.eip = jip;
 					PC = LONG_CS + jip;
-#ifdef SKIP_EMU_VBIOS
-					if ((jcs&0xf000)==config.vbios_seg) {
-					    /* return the new PC after the jump */
-					    TheCPU.err = EXCP_GOBACK; return PC;
-					}
-#endif
 				}
 				break;
 			case Ofs_SI:	/*6*/	 // PUSH
@@ -2703,44 +2837,45 @@ repag0:
 			    CODE_FLUSH();
 			    goto not_implemented;
 //
-			case 0x80: /* JOimmdisp */
-			case 0x81: /* JNOimmdisp */
-			case 0x82: /* JBimmdisp */
-			case 0x83: /* JNBimmdisp */
-			case 0x84: /* JZimmdisp */
-			case 0x85: /* JNZimmdisp */
-			case 0x86: /* JBEimmdisp */
-			case 0x87: /* JNBEimmdisp */
-			case 0x88: /* JSimmdisp */
-			case 0x89: /* JNSimmdisp */
-			case 0x8a: /* JPimmdisp */
-			case 0x8b: /* JNPimmdisp */
-			case 0x8c: /* JLimmdisp */
-			case 0x8d: /* JNLimmdisp */
-			case 0x8e: /* JLEimmdisp */
-			case 0x8f: /* JNLEimmdisp */
+			case JOimmdisp:		/*80*/
+			case JNOimmdisp:	/*81*/
+			case JBimmdisp:		/*82*/
+			case JNBimmdisp:	/*83*/
+			case JZimmdisp:		/*84*/
+			case JNZimmdisp:	/*85*/
+			case JBEimmdisp:	/*86*/
+			case JNBEimmdisp:	/*87*/
+			case JSimmdisp:		/*88*/
+			case JNSimmdisp:	/*89*/
+			case JPimmdisp:		/*8a*/
+			case JNPimmdisp:	/*8b*/
+			case JLimmdisp:		/*8c*/
+			case JNLimmdisp:	/*8d*/
+			case JLEimmdisp:	/*8e*/
+			case JNLEimmdisp:	/*8f*/
 				{
-				  PC = JumpGen(PC, mode, (opc2-0x80), 1);
+				  PC = JumpGen(PC, mode, JO+(opc2-JOimmdisp),
+					       2 + BT24(BitDATA16,mode));
 				  if (TheCPU.err) return PC;
 				}
 				break;
 ///
-			case 0x90: /* SETObrm */
-			case 0x91: /* SETNObrm */
-			case 0x92: /* SETBbrm */
-			case 0x93: /* SETNBbrm */
-			case 0x94: /* SETZbrm */
-			case 0x95: /* SETNZbrm */
-			case 0x96: /* SETBEbrm */
-			case 0x97: /* SETNBEbrm */
-			case 0x98: /* SETSbrm */
-			case 0x99: /* SETNSbrm */
-			case 0x9a: /* SETPbrm */
-			case 0x9b: /* SETNPbrm */
-			case 0x9c: /* SETLbrm */
-			case 0x9d: /* SETNLbrm */
-			case 0x9e: /* SETLEbrm */
-			case 0x9f: /* SETNLEbrm */
+			case SETObrm:		/*90*/
+			case SETNObrm:		/*91*/
+			case SETBbrm:		/*92*/
+			case SETNBbrm:		/*93*/
+			case SETZbrm:		/*94*/
+			case SETNZbrm:		/*95*/
+			case SETBEbrm:		/*96*/
+			case SETNBEbrm:		/*97*/
+			case SETSbrm:		/*98*/
+			case SETNSbrm:		/*99*/
+			case SETPbrm:		/*9a*/
+			case SETNPbrm:		/*9b*/
+			case SETLbrm:		/*9c*/
+			case SETNLbrm:		/*9d*/
+			case SETLEbrm:		/*9e*/
+			case SETNLEbrm:		/*9f*/
 				Gen(O_SETCC, mode, (opc2&0x0f));
 				PC++; PC += ModRM(opc, PC, mode|MBYTE|MSTORE);
 				break;

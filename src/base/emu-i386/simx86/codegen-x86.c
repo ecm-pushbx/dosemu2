@@ -1240,7 +1240,8 @@ shrot0:
 		};
 		unsigned char *q=Cp; GNX(Cp, pseqpre, sizeof(pseqpre));
 		if (mode&DATA16) q[8] = 0xfe; /* use -2 in lea ins */
-//		if (in_dpmi) {
+#if 0		// unused "extended PVI", if used should move to separate op
+		if (!V86MODE() && IOPL < 3 && (TheCPU.cr[4] & CR4_PVI)) {
 		    /* This solves the DOSX 'System test 8' error.
 		     * The virtualized IF is pushed instead of the
 		     * real one (which is always 1). This way, tests
@@ -1263,11 +1264,14 @@ shrot0:
 			G4((unsigned char *)&_EFLAGS-CPUOFFS(0),Cp);
 			// (19 from bt); rcl $10,%%eax
 			G4M(0x13,0xc1,0xd0,0x0a,Cp);
-//		}
+		}
+#endif
 		if (mode&DATA16) {
 			// movw %%ax,(%%esi,%%ecx,1)
 			G4M(0x66,0x89,0x04,0x0e,Cp);
 		} else {
+			// andl RETURN_MASK|EFLAGS_IF,%%eax
+			G1(0x25,Cp); G4(RETURN_MASK|EFLAGS_IF,Cp);
 			// movl %%eax,(%%esi,%%ecx,1)
 			G3M(0x89,0x04,0x0e,Cp);
 		}
@@ -1332,7 +1336,7 @@ shrot0:
 			// movw (%%esi,%%ecx,1),%%ax
 			0x66,0x8b,0x04,0x0e,
 			// leal 2(%%ecx),%%ecx
-			0x8d,0x49,0x02,
+/*0d*/			0x8d,0x89,0x02,0x00,0x00,0x00,
 #ifdef STACK_WRAP_MP	/* mask after incrementing */
 			// andl StackMask(%%ebx),%%ecx
 			0x23,0x4b,Ofs_STACKM,
@@ -1350,7 +1354,7 @@ shrot0:
 			// movl (%%esi,%%ecx,1),%%eax
 			0x90,0x8b,0x04,0x0e,
 			// leal 4(%%ecx),%%ecx
-			0x8d,0x49,0x04,
+/*0d*/			0x8d,0x89,0x04,0x00,0x00,0x00,
 #ifdef STACK_WRAP_MP	/* mask after incrementing */
 			// andl StackMask(%%ebx),%%ecx
 			0x23,0x4b,Ofs_STACKM,
@@ -1369,12 +1373,16 @@ shrot0:
 			0x89,0x4b,Ofs_ESP
 		};
 		const unsigned char *p; int sz;
+		unsigned char *q;
 		if (mode&DATA16) p=pseq16,sz=sizeof(pseq16);
 			else p=pseq32,sz=sizeof(pseq32);
 		// for popping into memory the sequence is:
 		//	first do address calculation, then pop,
 		//	then store data, and last adjust stack
-		GNX(Cp, p, sz);
+		q = Cp; GNX(Cp, p, sz);
+		if (mode&MRETISP)
+			/* adjust stack after pop */
+			*(int32_t *)(q+0xf) += IG->p0;
 		} break;
 
 /* POP derived (sub-)sequences: */
@@ -1871,6 +1879,10 @@ shrot0:
 			G3M(0xc7,0x43,Ofs_DF_INCREMENTS,Cp);
 			G4(0xfcfeff,Cp);
 			break;
+		case CLI:
+			// andb $0xfd,EFLAGS+1(%%ebx)
+			G4M(0x80,0x63,Ofs_EFLAGS+1,~(uint8_t)(EFLAGS_IF>>8),Cp);
+			break;
 		} }
 		break;
 	case O_BSWAP: {
@@ -2027,7 +2039,22 @@ shrot0:
 		}
 		break;
 
-	case JMP_LINK: {	// cond, dspt, retaddr, link
+	case JMP_INDIRECT: {	// input: %%{e}ax = %%{e}ip
+		linkdesc *lt = IG->lt;
+		lt->t_type = JMP_INDIRECT;
+		if (mode&DATA16)
+			// movz{wl} %%ax,%%eax
+			G3M(0x0f,0xb7,0xc0,Cp);
+		// addl Ofs_XCS(%%ebx),%%eax
+		G3M(0x03,0x43,Ofs_XCS,Cp);
+		// subl Ofs_MEMBASE(%%ebx),%%eax
+		G3M(0x2b,0x43,Ofs_MEMBASE,Cp);
+		// pop %%edx; ret
+		G2M(0x5a,0xc3,Cp);
+		}
+		break;
+
+	case JMP_LINK: {	// opc, dspt, retaddr, link
 		const unsigned char pseq16[] = {
 			// movw $RA,%%ax
 /*00*/			0xb8,0,0,0,0,
@@ -2060,11 +2087,11 @@ shrot0:
 			// movl %%ecx,Ofs_ESP(%%ebx)
 			0x89,0x4b,Ofs_ESP
 		};
-		unsigned char cond = IG->p0;
+		unsigned char opc = IG->p0;
 		int dspt = IG->p1;
 		int dspnt = IG->p2;
 		linkdesc *lt = IG->lt;
-		if (cond == 0x11) {	// call
+		if (opc == CALLd || opc == CALLl) {
 			const unsigned char *p;
 			unsigned char *q;
 			int sz;
@@ -2100,8 +2127,8 @@ shrot0:
 		break;
 
 	case JF_LINK:
-	case JB_LINK: {		// cond, PC, dspt, dspnt, link
-		unsigned char cond = IG->p0;
+	case JB_LINK: {		// opc, PC, dspt, dspnt, link
+		unsigned char opc = IG->p0;
 		int jpc = IG->p1;
 		int dspt = IG->p2;
 		int dspnt = IG->p3;
@@ -2114,7 +2141,7 @@ shrot0:
 		//	b8 [sig_pc] 5a c3
 		//	b8 [t_pc] 5a c3
 		sz = TAILSIZE + (mode & CKSIGN? 13:0);
-		if (cond==0x31) {
+		if (opc==JCXZ) {
 			if (mode&ADDR16) {
 			    // movzwl Ofs_ECX(%%ebx),%%ecx
 			    G4M(0x0f,0xb7,0x4b,Ofs_ECX,Cp);
@@ -2127,7 +2154,7 @@ shrot0:
 		}
 		else {
 			PopPushF(Cp);	// get flags from stack
-			G2M(0x70|cond,sz,Cp);	// normal cond
+			G2M(opc,sz,Cp);	// normal condition (Jcc)
 		}
 		if (mode & CKSIGN) {
 		    // check signal on NOT TAKEN branch
@@ -2160,8 +2187,8 @@ shrot0:
 		}
 		break;
 
-	case JLOOP_LINK: {	// cond, PC, dspt, dspnt, link
-		unsigned char cond = IG->p0;
+	case JLOOP_LINK: {	// opc, PC, dspt, dspnt, link
+		unsigned char opc = IG->p0;
 		int dspt = IG->p1;
 		int dspnt = IG->p2;
 		linkdesc *lt = IG->lt;
@@ -2181,17 +2208,17 @@ shrot0:
 			G3M(0xff,0x4b,Ofs_ECX,Cp);
 		}
 		/*
-		 * 20 LOOP   taken = (e)cx		nt=cxz
-		 * 24 LOOPZ  taken = (e)cx &&  ZF	nt=cxz||!ZF
-		 * 25 LOOPNZ taken = (e)cx && !ZF	nt=cxz|| ZF
+		 * e2 LOOP   taken = (e)cx		nt=cxz
+		 * e1 LOOPZ  taken = (e)cx &&  ZF	nt=cxz||!ZF
+		 * e0 LOOPNZ taken = (e)cx && !ZF	nt=cxz|| ZF
 		 */
-		if (cond==0x24) {		// loopz
+		if (opc==LOOPZ_LOOPE) {
 			G2M(0x74,0x06,Cp);		// jz->nt
 			// test flags (on stack)
 			G4M(0xf6,0x04,0x24,0x40,Cp);
 			G2M(0x75,TAILSIZE,Cp);	// jnz->t
 		}
-		else if (cond==0x25) {		// loopnz
+		else if (opc==LOOPNZ_LOOPNE) {
 			G2M(0x74,0x06,Cp);		// jz->nt
 			// test flags (on stack)
 			G4M(0xf6,0x04,0x24,0x40,Cp);
@@ -2362,7 +2389,6 @@ static void Gen_x86(int op, int mode, ...)
 	case O_PUSH1:
 	case O_PUSH2F:
 	case O_PUSH3:
-	case O_POP:
 	case O_POP1:
 	case O_POP3:
 	case O_LEAVE:
@@ -2493,6 +2519,10 @@ static void Gen_x86(int op, int mode, ...)
 		}
 		break;
 
+	case O_POP:
+		if (mode & MRETISP) IG->p0 = Offs_From_Arg();
+		break;
+
 	case O_PUSH2:
 	case O_POP2: {
 		signed char o = Offs_From_Arg();
@@ -2537,10 +2567,14 @@ static void Gen_x86(int op, int mode, ...)
 		}
 		} break;
 
-	case JMP_LINK:		// cond, dspt, retaddr, link
+	case JMP_INDIRECT:
+		IG->lt = va_arg(ap,linkdesc *);	// lt
+		break;
+
+	case JMP_LINK:		// opc, dspt, retaddr, link
 	case JLOOP_LINK: {
-		unsigned char cond = (unsigned char)va_arg(ap,int);
-		IG->p0 = cond;
+		unsigned char opc = (unsigned char)va_arg(ap,int);
+		IG->p0 = opc;
 		IG->p1 = va_arg(ap,int);	// dspt
 		IG->p2 = va_arg(ap,int);	// dspnt
 		IG->lt = va_arg(ap,linkdesc *);	// lt
@@ -2548,9 +2582,9 @@ static void Gen_x86(int op, int mode, ...)
 		break;
 
 	case JF_LINK:
-	case JB_LINK: {		// cond, PC, dspt, dspnt, link
-		unsigned char cond = (unsigned char)va_arg(ap,int);
-		IG->p0 = cond;
+	case JB_LINK: {		// opc, PC, dspt, dspnt, link
+		unsigned char opc = (unsigned char)va_arg(ap,int);
+		IG->p0 = opc;
 		IG->p1 = va_arg(ap,int);	// jpc
 		IG->p2 = va_arg(ap,int);	// dspt
 		IG->p3 = va_arg(ap,int);	// dspnt
@@ -2714,7 +2748,7 @@ static void _nodelinker2(TNode *LG, TNode *G)
 	if (LG && (LG->alive>0)) {
 	    int ra;
 	    linkdesc *L = &LG->clink;
-	    if (L->t_type) {	// node ends with links
+	    if (L->t_type>=JMP_LINK) {	// node ends with links
 		lp = L->t_link.abs;		// check 'taken' branch
 		if (*lp==G->key && ((unsigned char*)lp)[-1] == 0xb8) {		// points to current node?
 		    if (L->t_ref!=0) {

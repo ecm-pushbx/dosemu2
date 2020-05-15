@@ -115,7 +115,6 @@ typedef struct {
 	unsigned int sreg1;
 	unsigned int dreg1;
 	unsigned int xreg1;
-	unsigned int veflags;
 
 /*
  * DR0-3 = linear address of breakpoint 0-3
@@ -194,6 +193,7 @@ extern union _SynCPU TheCPU_union;
 #define Ofs_ESI		(unsigned char)(offsetof(SynCPU,esi)-SCBASE)
 #define rEDI		TheCPU.edi
 #define Ofs_EDI		(unsigned char)(offsetof(SynCPU,edi)-SCBASE)
+#define Ofs_EIP		(unsigned char)(offsetof(SynCPU,eip)-SCBASE)
 
 #define Ofs_CS		(unsigned char)(offsetof(SynCPU,cs)-SCBASE)
 #define Ofs_DS		(unsigned char)(offsetof(SynCPU,ds)-SCBASE)
@@ -279,7 +279,6 @@ extern union _SynCPU TheCPU_union;
 #define MEMREF		TheCPU.mem_ref
 #define EFLAGS		TheCPU.eflags
 #define FLAGS		CPUWORD(Ofs_EFLAGS)
-#define eVEFLAGS	TheCPU.veflags
 #define FPX		TheCPU.fpstt
 
 #define CS_DTR		TheCPU.cs_cache

@@ -357,8 +357,7 @@ int fatfs_read(fatfs_t *f, unsigned buf, unsigned pos, int len)
  */
 int fatfs_write(fatfs_t *f, unsigned buf, unsigned pos, int len)
 {
-
-  fatfs_deb("write: dir %s, sec %u, len %d\n", f->dir, pos, len);
+  error("fatfs write ignored: dir %s, sec %u, len %d\n", f->dir, pos, len);
 
   if(!f->ok) return -1;
 
@@ -1263,7 +1262,7 @@ unsigned dos_time(time_t *tt)
 
   return (t->tm_sec >> 1) + (t->tm_min << 5) + (t->tm_hour << 11) +
          (t->tm_mday << 16) + ((t->tm_mon + 1) << 21) +
-         ((t->tm_year < 80 ? 0 : t->tm_year - 80) << 25);
+         ((unsigned)(t->tm_year < 80 ? 0 : t->tm_year - 80) << 25);
 }
 
 

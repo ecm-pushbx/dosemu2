@@ -304,7 +304,7 @@ static void (*clnup_handler)(void);
 
 int register_cleanup_handler(void (*call)(void))
 {
-    assert(!clnup_handler);
+//    assert(!clnup_handler);
     clnup_handler = call;
     return 0;
 }
@@ -637,12 +637,6 @@ static int dos_helper(int stk_offs)
 	}
 	break;
     }
-
-    case DOS_HELPER_0x53:
-	{
-	    LWORD(eax) = run_unix_command(SEG_ADR((char *), es, dx));
-	    break;
-	}
 
     case DOS_HELPER_GET_CPU_SPEED:
 	{

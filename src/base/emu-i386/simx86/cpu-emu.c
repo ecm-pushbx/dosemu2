@@ -49,17 +49,6 @@
 #include "dis8086.h"
 #include "sig.h"
 
-#define e_set_flags(X,new,mask) \
-	((X) = ((X) & ~(mask)) | ((new) & (mask)))
-
-/*
- *  ID VIP VIF AC VM RF 0 NT IOPL OF DF IF TF SF ZF 0 AF 0 PF 1 CF
- *                                 1  1  0  1  1  1 0  1 0  1 0  1
- */
-#define SAFE_MASK	(0xDD5)		/* ~(reserved flags plus IF) */
-#define notSAFE_MASK	(~SAFE_MASK&0x3fffff)
-#define RETURN_MASK	(0xDFF)		/* ~IF */
-
 /* ======================================================================= */
 
 #ifdef PROFILE
@@ -160,7 +149,6 @@ sigcontext_t e_scp; /* initialized to 0 */
 /* ======================================================================= */
 
 unsigned long eTSSMASK = 0;
-#define VFLAGS	(*(unsigned short *)&TheCPU.veflags)
 
 void e_priv_iopl(int pl)
 {
@@ -236,9 +224,7 @@ char *e_print_regs(void)
 	exprintl(rEDI,buf,(ERB_L2+ERB_LEFTM)+13);
 	exprintl(rEBP,buf,(ERB_L2+ERB_LEFTM)+26);
 	exprintl(rESP,buf,(ERB_L2+ERB_LEFTM)+39);
-	if (TheCPU.eflags&EFLAGS_VM)
-		exprintl(TheCPU.veflags,buf,(ERB_L3+ERB_LEFTM));
-	else
+	if (!(TheCPU.eflags&EFLAGS_VM))
 		exprintl(get_FLAGS(TheCPU.eflags),buf,(ERB_L3+ERB_LEFTM));
 	exprintw(TheCPU.cs,buf,(ERB_L3+ERB_LEFTM)+13);
 	exprintw(TheCPU.ds,buf,(ERB_L3+ERB_LEFTM)+26);
@@ -495,19 +481,20 @@ static void Reg2Cpu (int mode)
   unsigned long flg;
  /*
   * Enter VM86
-  * Copy the dosemu flags (in vm86s) into our veflags, which are the
-  * equivalent of the VEFLAGS in /linux/arch/i386/kernel/vm86.c
   */
-  eVEFLAGS = vm86s.regs.eflags | RF;
 
  /* From now on we'll work on the cpuemu eflags (BUT vm86s eflags can be
-  * changed asynchronously by signals) */
-  TheCPU.eflags = vm86s.regs.eflags & SAFE_MASK;
+  * changed asynchronously by signals)
+  * Note that IOPL=3 in the emulated flags so cpuemu works directly with
+    IF, not VIF */
+  TheCPU.eflags = (vm86s.regs.eflags & SAFE_MASK) | IOPL_MASK;
+  if (isset_IF())
+    TheCPU.eflags |= EFLAGS_IF;
   /* get the protected mode flags. Note that RF and VM are cleared
    * by pushfd (but not by ints and traps). Equivalent to regs32->eflags
    * in vm86.c */
   flg = getflags();
-  TheCPU.eflags |= (flg & notSAFE_MASK); // which VIP do we get here?
+  TheCPU.eflags |= (flg & notSAFE_MASK & ~EFLAGS_IF); // which VIP do we get here?
   TheCPU.eflags |= (VM | RF);	// RF is cosmetic...
   TheCPU.df_increments = (TheCPU.eflags&DF)?0xfcfeff:0x040201;
 
@@ -517,8 +504,8 @@ static void Reg2Cpu (int mode)
     config.cpuemu=4-vm86only;
   }
 
-  if (debug_level('e')>1) e_printf("Reg2Cpu> vm86=%08x dpm=%08x emu=%08x evf=%08x\n",
-	REG(eflags),get_FLAGS(TheCPU.eflags),TheCPU.eflags,TheCPU.veflags);
+  if (debug_level('e')>1) e_printf("Reg2Cpu> vm86=%08x dpm=%08x emu=%08x\n",
+	REG(eflags),get_FLAGS(TheCPU.eflags),TheCPU.eflags);
   TheCPU.eax     = REG(eax);	/* 2c -> 18 */
   TheCPU.ebx     = REG(ebx);	/* 20 -> 00 */
   TheCPU.ecx     = REG(ecx);	/* 28 -> 04 */
@@ -539,11 +526,11 @@ static void Reg2Cpu (int mode)
   trans_addr     = LONG_CS + TheCPU.eip;
 
   if (debug_level('e')>1) {
-	if (debug_level('e')==3) e_printf("Reg2Cpu< vm86=%08x dpm=%08x emu=%08x evf=%08x\n%s\n",
-		REG(eflags),get_FLAGS(TheCPU.eflags),TheCPU.eflags,TheCPU.veflags,
+	if (debug_level('e')==3) e_printf("Reg2Cpu< vm86=%08x dpm=%08x emu=%08x\n%s\n",
+		REG(eflags),get_FLAGS(TheCPU.eflags),TheCPU.eflags,
 		e_print_regs());
-	else e_printf("Reg2Cpu< vm86=%08x dpm=%08x emu=%08x evf=%08x\n",
-		REG(eflags),get_FLAGS(TheCPU.eflags),TheCPU.eflags,TheCPU.veflags);
+	else e_printf("Reg2Cpu< vm86=%08x dpm=%08x emu=%08x\n",
+		REG(eflags),get_FLAGS(TheCPU.eflags),TheCPU.eflags);
   }
 }
 
@@ -552,9 +539,8 @@ static void Reg2Cpu (int mode)
  */
 void Cpu2Reg (void)
 {
-  int mask;
-  if (debug_level('e')>1) e_printf("Cpu2Reg> vm86=%08x dpm=%08x emu=%08x evf=%08x\n",
-	REG(eflags),get_FLAGS(TheCPU.eflags),TheCPU.eflags,TheCPU.veflags);
+  if (debug_level('e')>1) e_printf("Cpu2Reg> vm86=%08x dpm=%08x emu=%08x\n",
+	REG(eflags),get_FLAGS(TheCPU.eflags),TheCPU.eflags);
   REG(eax) = TheCPU.eax;
   REG(ebx) = TheCPU.ebx;
   REG(ecx) = TheCPU.ecx;
@@ -571,16 +557,20 @@ void Cpu2Reg (void)
   SREG(cs)  = TheCPU.cs;
   REG(eip) = TheCPU.eip;
   /*
-   * move (VIF|TSSMASK) flags from VEFLAGS to eflags; resync vm86s eflags
+   * move flags from EFLAGS to eflags; resync vm86s eflags
    * from the emulated ones.
    * The cpuemu should not change VIP, the good one is always in vm86s.
    */
-  mask = VIF | eTSSMASK;
   REG(eflags) = (REG(eflags) & VIP) |
-  			(eVEFLAGS & mask) | (TheCPU.eflags & ~(mask|VIP));
+			(TheCPU.eflags & ~VIP);
+  if (TheCPU.eflags & EFLAGS_IF)
+    set_IF();
+  else
+    clear_IF();
+  REG(eflags) |= EFLAGS_IF;
 
-  if (debug_level('e')>1) e_printf("Cpu2Reg< vm86=%08x dpm=%08x emu=%08x evf=%08x\n",
-	REG(eflags),get_FLAGS(TheCPU.eflags),TheCPU.eflags,TheCPU.veflags);
+  if (debug_level('e')>1) e_printf("Cpu2Reg< vm86=%08x dpm=%08x emu=%08x\n",
+	REG(eflags),get_FLAGS(TheCPU.eflags),TheCPU.eflags);
 }
 
 
@@ -621,8 +611,8 @@ static void Scp2Cpu (sigcontext_t *scp)
  */
 static void Cpu2Scp (sigcontext_t *scp, int trapno)
 {
-  if (debug_level('e')>1) e_printf("Cpu2Scp> scp=%08x dpm=%08x fl=%08x vf=%08x\n",
-	_eflags,get_FLAGS(TheCPU.eflags),TheCPU.eflags,eVEFLAGS);
+  if (debug_level('e')>1) e_printf("Cpu2Scp> scp=%08x dpm=%08x fl=%08x\n",
+	_eflags,get_FLAGS(TheCPU.eflags),TheCPU.eflags);
 
   /* setup stack context from cpu registers */
   _eax = TheCPU.eax;
@@ -665,8 +655,13 @@ static void Cpu2Scp (sigcontext_t *scp, int trapno)
 
   /* push running flags - same as eflags, RF is cosmetic */
   _eflags = (TheCPU.eflags & (eTSSMASK|0xfd5)) | 0x10002;
-  if (debug_level('e')>1) e_printf("Cpu2Scp< scp=%08x vm86=%08x dpm=%08x fl=%08x vf=%08x\n",
-	_eflags,REG(eflags),get_FLAGS(TheCPU.eflags),TheCPU.eflags,eVEFLAGS);
+  if (TheCPU.eflags & EFLAGS_IF)
+    set_IF();
+  else
+    clear_IF();
+  _eflags |= EFLAGS_IF;
+  if (debug_level('e')>1) e_printf("Cpu2Scp< scp=%08x vm86=%08x dpm=%08x fl=%08x\n",
+	_eflags,REG(eflags),get_FLAGS(TheCPU.eflags),TheCPU.eflags);
 }
 
 
@@ -728,6 +723,7 @@ erseg:
 void reset_emu_cpu(void)
 {
   TheCPU.cr[0] = 0x13;	/* valid bits: 0xe005003f */
+  TheCPU.cr[4] = CR4_VME;
   TheCPU.dr[4] = 0xffff1ff0;
   TheCPU.dr[5] = 0x400;
   TheCPU.dr[6] = 0xffff1ff0;
@@ -996,66 +992,12 @@ void leave_cpu_emu(void)
  * original code by Linus Torvalds and later enhancements by
  * Lutz Molgedey and Hans Lermen.
  */
-static inline unsigned long e_get_vflags(void)
-{
-	unsigned long flags = REG(eflags) & RETURN_MASK;
-
-	if (eVEFLAGS & VIF_MASK)
-		flags |= IF_MASK;
-	return flags | ((IOPL_MASK|eVEFLAGS) & eTSSMASK);
-}
-
-static inline int e_revectored(int nr, struct revectored_struct * bitmap)
-{
-	__asm__ __volatile__("btl %2,%1\n\tsbbl %0,%0"
-		:"=r" (nr)
-		:"m" (*bitmap),"r" (nr));
-	return nr;
-}
-
-static int e_do_int(int i, unsigned int ssp, unsigned int sp)
-{
-	unsigned int *intr_ptr, segoffs;
-
-	if (e_revectored(i, &vm86s.int_revectored))
-		goto cannot_handle;
-	intr_ptr = MK_FP32(0, i << 2);
-	segoffs = *intr_ptr;
-	pushw(ssp, sp, e_get_vflags());
-	pushw(ssp, sp, _CS);
-	pushw(ssp, sp, _IP);
-	_CS = segoffs >> 16;
-	_SP -= 6;
-	_IP = segoffs & 0xffff;
-	REG(eflags) &= ~(TF|RF|AC|NT|VIF);
-	if (debug_level('e')>1)
-	    dbug_printf("EMU86: directly calling int %#x ax=%#x at %#x:%#x\n",
-			    i, _AX, _CS, _IP);
-	return -1;
-
-cannot_handle:
-	if (debug_level('e')>1)
-	    dbug_printf("EMU86: calling revectored int %#x\n", i);
-	return (VM86_INTx + (i << 8));
-}
-
-
-static int handle_vm86_trap(int *error_code, int trapno)
-{
-	if ( (trapno==3) || (trapno==1) )
-		return (VM86_TRAP + (trapno << 8));
-	return e_do_int(trapno, SEGOFF2LINEAR(_SS, 0), _SP);
-}
-
-
 static int handle_vm86_fault(int *error_code)
 {
-	unsigned int csp, ssp, ip, sp;
+	unsigned int csp, ip;
 	unsigned char op;
 
 	csp = SEGOFF2LINEAR(_CS, 0);
-	ssp = SEGOFF2LINEAR(_SS, 0);
-	sp = _SP;
 	ip = _IP;
 	op = popb(csp, ip);
 	if (debug_level('e')>1) e_printf("EMU86: vm86 fault %#x at %#x:%#x\n",
@@ -1065,14 +1007,9 @@ static int handle_vm86_fault(int *error_code)
 	if (op==0xcd) {
 	        int intno=popb(csp, ip);
 		_IP += 2;
-#ifdef USE_MHPDBG
-		if (mhpdbg.active) {
-			if ( (1 << (intno &7)) & mhpdbg.intxxtab[intno >> 3] ) {
-				return (VM86_INTx + (intno << 8));
-			}
-		}
-#endif
-		return e_do_int(intno, ssp, sp);
+		if (debug_level('e')>1)
+			dbug_printf("EMU86: calling revectored int %#x\n", intno);
+		return VM86_INTx + (intno << 8);
 	}
 	else
 		return VM86_UNKNOWN;
@@ -1193,7 +1130,7 @@ int e_vm86(void)
 	      break;
 	    case EXCP01_SSTP:
 	    case EXCP03_INT3: {	/* to kernel vm86 */
-		retval=handle_vm86_trap(&errcode,xval-1); /* kernel level */
+		retval = VM86_TRAP + ((xval-1) << 8);
 		break;
 	      }
 	    default: {

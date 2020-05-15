@@ -144,10 +144,11 @@
 #define O_OUTPDX	110
 #define O_OUTPPC	111
 
-#define JMP_LINK	112
-#define JB_LINK		113
-#define JF_LINK		114
-#define JLOOP_LINK	115
+#define JMP_INDIRECT	112
+#define JMP_LINK	113
+#define JB_LINK		114
+#define JF_LINK		115
+#define JLOOP_LINK	116
 
 /////////////////////////////////////////////////////////////////////////////
 //
@@ -172,6 +173,7 @@
 #define MOVSSRC	0x00004000
 #define MOVSDST	0x00008000
 #define MPOPRM	0x00010000
+#define MRETISP	0x00020000
 
 #define CKSIGN	0x00100000	// check signal: for jumps
 #define SKIPOP	0x00200000

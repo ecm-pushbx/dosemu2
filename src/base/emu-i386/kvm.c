@@ -355,7 +355,7 @@ int init_kvm_cpu(void)
 {
   kvmfd = open("/dev/kvm", O_RDWR | O_CLOEXEC);
   if (kvmfd == -1) {
-    warn("KVM: error opening /dev/kvm: %s\n", strerror(errno));
+    error("KVM: error opening /dev/kvm: %s\n", strerror(errno));
     return 0;
   }
 
@@ -421,7 +421,7 @@ static int mmap_kvm_no_overlap(unsigned targ, void *addr, size_t mapsize)
   return slot;
 }
 
-static void munmap_kvm(unsigned targ, size_t mapsize)
+static void do_munmap_kvm(dosaddr_t targ, size_t mapsize)
 {
   /* unmaps KVM regions from targ to targ+mapsize, taking care of overlaps */
   int slot;
@@ -448,6 +448,11 @@ static void munmap_kvm(unsigned targ, size_t mapsize)
   }
 }
 
+void munmap_kvm(int cap, dosaddr_t targ, size_t mapsize)
+{
+  do_munmap_kvm(targ, mapsize);
+}
+
 void mmap_kvm(int cap, void *addr, size_t mapsize, int protect)
 {
   dosaddr_t targ;
@@ -471,7 +476,7 @@ void mmap_kvm(int cap, void *addr, size_t mapsize, int protect)
     }
   }
   /* with KVM we need to manually remove/shrink existing mappings */
-  munmap_kvm(targ, mapsize);
+  do_munmap_kvm(targ, mapsize);
   slot = mmap_kvm_no_overlap(targ, addr, mapsize);
   mprotect_kvm(cap, targ, mapsize, protect);
   /* update EPT if needed */

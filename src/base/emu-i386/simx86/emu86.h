@@ -326,6 +326,48 @@ extern hitimer_t GenTime, LinkTime;
 #define GRP2brm		0xfeu
 #define GRP2wrm		0xffu
 
+// pseudo-opcodes for GRP2wrm
+#define CALLi		((GRP2wrm<<8)|Ofs_DX)
+#define CALLli		((GRP2wrm<<8)|Ofs_BX)
+#define JMPi		((GRP2wrm<<8)|Ofs_SP)
+#define JMPli		((GRP2wrm<<8)|Ofs_BP)
+
+// 2 byte opcodes with TwoByteESC (0x0f) prefix
+#define JOimmdisp	0x80u
+#define JNOimmdisp	0x81u
+#define JBimmdisp	0x82u
+#define JNBimmdisp	0x83u
+#define JZimmdisp	0x84u
+#define JNZimmdisp	0x85u
+#define JBEimmdisp	0x86u
+#define JNBEimmdisp	0x87u
+#define JSimmdisp	0x88u
+#define JNSimmdisp	0x89u
+#define JPimmdisp	0x8au
+#define JNPimmdisp	0x8bu
+#define JLimmdisp	0x8cu
+#define JNLimmdisp	0x8du
+#define JLEimmdisp	0x8eu
+#define JNLEimmdisp	0x8fu
+
+#define SETObrm		0x90u
+#define SETNObrm	0x91u
+#define SETBbrm		0x92u
+#define SETNBbrm	0x93u
+#define SETZbrm		0x94u
+#define SETNZbrm	0x95u
+#define SETBEbrm	0x96u
+#define SETNBEbrm	0x97u
+#define SETSbrm		0x98u
+#define SETNSbrm	0x99u
+#define SETPbrm		0x9au
+#define SETNPbrm	0x9bu
+#define SETLbrm		0x9cu
+#define SETNLbrm	0x9du
+#define SETLEbrm	0x9eu
+#define SETNLEbrm	0x9fu
+
+// FP opcodes
 #define FADDm32r_sti	((ESC0<<3) | (0x0 & 0x38) >> 3)
 #define FMULm32r_sti	((ESC0<<3) | (0x8 & 0x38) >> 3)
 #define FCOMm32r_sti	((ESC0<<3) | (0x10 /*or 0xd0*/ & 0x38) >> 3)
@@ -538,6 +580,16 @@ extern hitimer_t GenTime, LinkTime;
 #define IS_OF_SET		((EFLAGS & EFLAGS_OF)!=0)
 #define IS_PF_SET		((EFLAGS & EFLAGS_PF)!=0)
 
+/*
+ *  ID VIP VIF AC VM RF 0 NT IOPL OF DF IF TF SF ZF 0 AF 0 PF 1 CF
+ *                                 1  1  0  1  1  1 0  1 0  1 0  1
+ */
+#define SAFE_MASK	(EFLAGS_OF|EFLAGS_DF|EFLAGS_TF|EFLAGS_SF| \
+			 EFLAGS_ZF|EFLAGS_AF|EFLAGS_PF|EFLAGS_CF| /* 0xDD5 */ \
+			 (eTSSMASK & ~IOPL_MASK))
+#define notSAFE_MASK	(~SAFE_MASK&0x3fffff)
+#define RETURN_MASK	((0xFFF&~EFLAGS_IF) | eTSSMASK)
+
 #define REALMODE()		((TheCPU.cr[0] & CR0_PE)==0)
 #define V86MODE()		((TheCPU.eflags&EFLAGS_VM)!=0)
 #define PROTMODE()		(!REALMODE() && !V86MODE())
@@ -642,7 +694,7 @@ extern int eTimeCorrect;
 //
 extern unsigned int return_addr;
 extern jmp_buf jmp_env;
-extern int in_dpmi_emu;
+extern int in_vm86_emu, in_dpmi_emu;
 extern unsigned long eTSSMASK;
 extern int Running;		/* into interpreter loop */
 extern unsigned int mMaxMem;
