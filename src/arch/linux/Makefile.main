@@ -23,7 +23,7 @@ SBEMU=base/dev/sb16 base/sound
 # re-configure, rather than just change this.
 #
 ifdef X86_EMULATOR
-XCPUEMU=emu-i386/simx86
+XCPUEMU=base/emu-i386/simx86
 endif
 
 # No longer need midid
@@ -31,14 +31,14 @@ endif
 
 DPMI = dosext/dpmi dosext/dpmi/msdos
 
-_LIBSUBDIRS=base/video base/dev/vga base/async base/kbd_unicode \
-	arch/linux/async arch/linux/mapping arch/linux/mcontext \
-	base/misc base/misc/libpcl base/dev/misc \
-	emu-i386 $(XCPUEMU) base/speaker \
-	base/dev/pic \
+_LIBSUBDIRS=base/video base/dev/vga base/core base/kbd_unicode \
+	arch/linux/async arch/linux/mapping base/lib/mcontext \
+	base/misc base/lib/misc base/lib/libpcl base/dev/misc \
+	base/emu-i386 $(XCPUEMU) base/speaker \
+	base/dev/pic base/dev/ne2k \
 	dosext/mfs dosext/misc dosext/builtins \
 	base/init base/serial base/mouse \
-	base/dev/dma env/translate \
+	base/dev/dma base/lib/translate \
 	$(NET) $(IPX) $(SBEMU) dosext/drivers base/bios base/bios/x86 \
 	$(DPMI)
 
@@ -46,54 +46,42 @@ LIBSUBDIRS=$(_LIBSUBDIRS) $(PLUGINSUBDIRS)
 ST_LIBSUBDIRS=$(_LIBSUBDIRS) $(ST_PLUGINSUBDIRS)
 
 # call all libraries the name of the directory
-LIBS_ := ${addsuffix .a,${addprefix lib/lib,$(subst /,_,$(ST_LIBSUBDIRS))}}
+LIBS_ := ${addsuffix .a,${addprefix $(top_builddir)/lib/lib,$(subst /,_,$(ST_LIBSUBDIRS))}}
 
 DOCS= $(top_builddir)/man
 
 ###################################################################
 
 default: $(top_builddir)/src/include/version.hh $(top_builddir)/$(PACKAGE_NAME).spec doslib \
-	$(top_builddir)/etc/xtermdos $(top_builddir)/etc/xinstallvgafont $(TFONTS)
+	$(TFONTS)
 	@echo ""
 	@echo "---------------------------------DONE compiling-------------------------------"
 	@echo ""
-	@echo " Now you must install DOSEMU. Make sure you are root and:"
-	@echo " make install"
+	@echo " Now you must install DOSEMU2 with the following command:"
+	@echo " sudo make install"
 	@echo ""
 	@echo ""
-
-$(top_builddir)/etc/xtermdos:	$(REALTOPDIR)/etc/xtermdos.sh
-	@echo "#!/bin/sh" > $(top_builddir)/etc/xtermdos
-	@echo >> $(top_builddir)/etc/xtermdos
-	@echo X11ROOTDIR=$(X11ROOTDIR) >> $(top_builddir)/etc/xtermdos
-	@echo >> $(top_builddir)/etc/xtermdos
-	@cat $(REALTOPDIR)/etc/xtermdos.sh >> $(top_builddir)/etc/xtermdos
-
-$(top_builddir)/etc/xinstallvgafont:	$(REALTOPDIR)/etc/xinstallvgafont.sh
-	@echo "#!/bin/sh" > $(top_builddir)/etc/xinstallvgafont
-	@echo >> $(top_builddir)/etc/xinstallvgafont
-	@echo X11ROOTDIR=$(X11ROOTDIR) >> $(top_builddir)/etc/xinstallvgafont
-	@echo >> $(top_builddir)/etc/xinstallvgafont
-	@cat $(REALTOPDIR)/etc/xinstallvgafont.sh >> $(top_builddir)/etc/xinstallvgafont
 
 $(top_builddir)/etc/%.pcf.gz: $(REALTOPDIR)/etc/%.bdf
 	bdftopcf $< | gzip -c -9 -n > $@
 
-emu.o: emu.c
+$(LIBS_): | $(top_builddir)/lib
 
-$(BINPATH)/bin/$(DOSBIN): emu.o $(LIBS_)
-	$(LD) $(ALL_LDFLAGS) $(DOSBIN_LDFLAGS) -o $@ emu.o \
+$(BINPATH)/bin/$(DOSBIN): $(LIBS_)
+	$(LD) $(ALL_LDFLAGS) $(DOSBIN_LDFLAGS) -o $@ \
 	   -Wl,--whole-archive $(LIBS_) -Wl,--no-whole-archive $(LIBS)
 	@nm $(BINPATH)/bin/$(DOSBIN) | grep -v '\(compiled\)\|\(\.o$$\)\|\( a \)' | \
 		sort > $(BINPATH)/bin/dosemu.map
 
 $(BINPATH)/bin/dosemu: $(SRCPATH)/bindist/dosemu.systemwide $(SRCPATH)/bindist/dosemu
-	sed -e "s|SYSTEM_BIN_PATH=NOT_SYSTEM_WIDE|SYSTEM_BIN_PATH=$(bindir)|" \
-		      $< > $(BINPATH)/bin/dosemu
-	tail -n +9 $(SRCPATH)/bindist/dosemu >> $(BINPATH)/bin/dosemu
-	chmod +x $(BINPATH)/bin/dosemu
+	cp $< $@
+	echo >> $@
+	echo "SYSTEM_BIN_PATH=$(bindir)" >> $@
+	echo >> $@
+	cat $(SRCPATH)/bindist/dosemu >> $@
+	chmod +x $@
 
-bin: $(top_builddir)/bin $(BINPATH)/bin/$(DOSBIN) $(BINPATH)/bin/dosemu
+bin: $(top_builddir)/bin $(top_builddir)/lib $(BINPATH)/bin/$(DOSBIN) $(BINPATH)/bin/dosemu
 
 # This recursive call seems to be necessary to deal with parallel makes.
 # Otherwise the rule for $(DOSBIN) would depend on a phony target, and
@@ -127,6 +115,8 @@ install:
 	$(INSTALL) -m 0644 $(SRCPATH)/bindist/config.sys $(sysdir)
 	$(INSTALL) -m 0644 $(SRCPATH)/bindist/autoexec.bat $(sysdir)
 	$(INSTALL) -m 0644 $(SRCPATH)/bindist/fdconfig.sys $(sysdir)
+	$(INSTALL) -m 0644 $(SRCPATH)/bindist/fdppconf.sys $(sysdir)
+	$(INSTALL) -m 0644 $(SRCPATH)/bindist/fdppauto.bat $(sysdir)
 	$(INSTALL) -m 0644 $(SRCPATH)/bindist/autoemu.bat $(sysdir)
 	$(INSTALL) -d $(cmddir)
 	for i in `find $(SYS)/* -type f`; do \
@@ -140,22 +130,17 @@ install:
 	  $(INSTALL) -m 0644 $(REALTOPDIR)/etc/dosemu.conf $(DESTDIR)$(etcdir); \
 	fi
 	$(INSTALL) -d $(DESTDIR)$(dosemudir)/keymap
-	for i in $(REALTOPDIR)/etc/keymap/*; do \
-	  if [ -f $$i ]; then \
-	    $(INSTALL) -m 0644 $$i $(DESTDIR)$(dosemudir)/keymap; \
-	  fi; \
-	done
+	$(INSTALL) -m 0644 $(REALTOPDIR)/etc/keymap/* $(DESTDIR)$(dosemudir)/keymap
+	$(INSTALL) -d $(DESTDIR)$(dosemudir)/cpi
+	$(INSTALL) -m 0644 $(REALTOPDIR)/etc/cpi/* $(DESTDIR)$(dosemudir)/cpi
 	$(INSTALL) -d $(DESTDIR)$(dosemudir)/icons
-	for i in $(REALTOPDIR)/etc/*.xpm; do \
-	  if [ -f $$i ]; then \
-	    $(INSTALL) -m 0644 $$i $(DESTDIR)$(dosemudir)/icons; \
-	  fi; \
-	done
+	$(INSTALL) -m 0644 $(REALTOPDIR)/etc/*.xpm $(DESTDIR)$(dosemudir)/icons
+	$(INSTALL) -m 0644 $(REALTOPDIR)/etc/locales.conf $(DESTDIR)$(dosemudir)
 	$(INSTALL) -d $(DESTDIR)$(bindir)
 	$(INSTALL) -m 0755 $(top_builddir)/bin/$(DOSBIN) $(DESTDIR)$(bindir)
 	$(INSTALL) -m 0755 $(top_builddir)/bin/dosemu $(DESTDIR)$(bindir)
-	$(INSTALL) -m 0755 $(top_builddir)/bin/mkfatimage16 $(DESTDIR)$(bindir)
-	$(INSTALL) -m 0755 $(top_builddir)/bin/dosdebug $(DESTDIR)$(bindir)
+	[ ! -f $(top_builddir)/bin/mkfatimage16 ] || $(INSTALL) -m 0755 $(top_builddir)/bin/mkfatimage16 $(DESTDIR)$(bindir)
+	[ ! -f $(top_builddir)/bin/dosdebug ] || $(INSTALL) -m 0755 $(top_builddir)/bin/dosdebug $(DESTDIR)$(bindir)
 	$(INSTALL) -d $(DESTDIR)$(plugindir)
 	for i in $(top_builddir)/bin/*.so; do \
 	  if [ -f $$i ]; then \
@@ -223,23 +208,7 @@ install:
 	@echo ""; \
 	 echo "---------------------------------DONE Installing-------------------------------"; \
 	 echo ""
-	@cd $(REALTOPDIR); if test -n "$(fdtarball)" -a ! -f "$(fdtarball)"; then \
-	  echo WARNING ;\
-	  echo No FreeDOS tarball \($(fdtarball)\);\
-	  echo found. If you are not ;\
-	  echo upgrading a working existing installation then please download one ;\
-	  echo from http://www.dosemu.org and re-run "make install".; \
-	  echo You can also use this procedure to upgrade an existing *FreeDOS*; \
-	  echo installation when a new tarball is available.; \
-	  echo Alternatively you can set fdtarball to none in compiletime-settings; \
-	  echo and use another DOS, which can be installed using dosemu -install,; \
-	  echo referred to using \$$_hdimage in $(etcdir)/dosemu.conf or \~/.dosemurc; \
-	  echo or symbolically linked from \~/.dosemu/drives/c.; \
-	  echo ; \
-	fi
-	@echo "  - You can type 'dosemu' to run DOSEMU. If you installed the FreeDOS tarball"; \
-	 echo "    too (see the warning above), then DOSEMU will set up a directory structure"; \
-	 echo "    in your home directory when you run it for the first time."
+	@echo "  - You can type 'dosemu' to run DOSEMU2."
 
 uninstall:
 	rm -rf $(DESTDIR)$(dosemudir)
@@ -254,7 +223,7 @@ uninstall:
 	ls $(DOCS)/ru/*.1 | xargs --max-args=1 basename | xargs -I {} --max-args=1 rm -f $(DESTDIR)$(mandir)/ru/man1/{}
 
 local_clean:
-	rm -f $(top_builddir)/bin $(top_builddir)/commands
+	rm -f $(top_builddir)/bin $(top_builddir)/commands $(top_builddir)/lib
 
 clean:: local_clean
 
@@ -277,5 +246,5 @@ $(REALCLEANDIRS):
 	-@$(MAKE) -C $(subst .realclean,,$@) realclean CLEANING=true
 
 pristine:	realclean
-	-rm -rf lib
-	-rm -rf $(BINPATH) $(top_builddir)/bin $(top_builddir)/commands $(top_builddir)/etc/xtermdos $(top_builddir)/etc/xinstallvgafont $(top_builddir)/etc/*.pcf.gz $(top_builddir)/etc/fonts.dir
+	-rm -rf $(top_builddir)/lib
+	-rm -rf $(BINPATH) $(top_builddir)/bin $(top_builddir)/commands $(top_builddir)/commands $(top_builddir)/commands $(top_builddir)/commands $(top_builddir)/etc/*.pcf.gz $(top_builddir)/etc/fonts.dir

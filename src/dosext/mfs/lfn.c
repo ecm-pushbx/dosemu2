@@ -25,6 +25,7 @@
 #include "mangle.h"
 #include "dos2linux.h"
 #include "bios.h"
+#include "int.h"
 #include "lfn.h"
 
 #define EOS '\0'
@@ -54,63 +55,6 @@ static unsigned long long unix_to_win_time(time_t ut)
 static time_t win_to_unix_time(unsigned long long wt)
 {
 	return (wt / 10000000) - (369 * 365 + 89)*24*60*60ULL;
-}
-
-/* returns: NULL: error (error code in fd; 0: SFT not owned by DOSEMU
-   otherwise it return the fd and the filename
-*/
-static char *handle_to_filename(int handle, int *fd)
-{
-	struct PSP *p = MK_FP32(READ_WORDP((unsigned char *)&sda_cur_psp(sda)), 0);
-	unsigned int filetab;
-	unsigned int sp;
-	unsigned char *sft;
-	int dd, idx;
-	dosaddr_t spp;
-
-	struct sfttbl {
-		FAR_PTR sftt_next;
-		unsigned short sftt_count;
-		unsigned char sftt_table[1];
-	};
-
-	/* Look up the handle via the PSP */
-	*fd = HANDLE_INVALID;
-	if (handle >= READ_WORDP((unsigned char *)&p->max_open_files))
-		return NULL;
-
-	filetab = rFAR_PTR(unsigned int, READ_DWORDP((unsigned char *)&p->file_handles_ptr));
-	idx = READ_BYTE(filetab + handle);
-	if (idx == 0xff)
-		return NULL;
-
-	/* Get the SFT block that contains the SFT      */
-	sp = READ_DWORD(lol + 4);
-	sft = NULL;
-	while ( (sp & 0xFFFF) != 0xffff) {
-		spp = rFAR_PTR(dosaddr_t, sp);
-		if (idx < READ_WORD_S(spp, struct sfttbl, sftt_count)) {
-			/* finally, point to the right entry            */
-			sft = LINEAR2UNIX(READ_WORD_S(spp +
-				idx * sft_record_size, struct sfttbl,
-				sftt_table));
-			break;
-		}
-		idx -= READ_WORD_S(spp, struct sfttbl, sftt_count);
-		sp = READ_DWORD_S(spp, struct sfttbl, sftt_next);
-	}
-	if ( (sp & 0xFFFF) == 0xffff )
-		return NULL;
-
-	/* do we "own" the drive? */
-	*fd = 0;
-	dd = sft_device_info(sft) & 0x0d1f;
-	if (dd == 0 && (sft_device_info(sft) & 0x8000))
-		dd = MAX_DRIVE - 1;
-	if (dd < 0 || dd >= MAX_DRIVE || !drives[dd].root)
-		return NULL;
-
-	return sft_to_filename(sft, fd);
 }
 
 static int close_dirhandle(int handle)
@@ -286,7 +230,8 @@ static int parse_name(const char **src, char **cp, char *dest)
 	return -1;
 }
 
-static int truename(char *dest, const char *src, int allowwildcards)
+static int truename(char *dest, const char *src, int allowwildcards,
+	int *r_drv)
 {
   int i;
   int result;
@@ -327,13 +272,14 @@ static int truename(char *dest, const char *src, int allowwildcards)
     result = toupperDOS(src0) - 'A';
   else
     result = sda_cur_drive(sda);
+  *r_drv = result;
 
   if (result < 0 || result >= MAX_DRIVE || result >= lol_last_drive(lol))
-    return -PATH_NOT_FOUND;
+    return -DISK_DRIVE_INVALID;
 
   /* LFN support is only for MFS drives, not Physical, Join or Subst */
   if (!drives[result].root)
-    return -PATH_NOT_FOUND;
+    return -DISK_DRIVE_INVALID;
 
   // I wonder why it was necessary to update the current cds ptr in the sda
   // WRITE_WORDP(&sda[sda_cds_off], lol_cdsfarptr(lol).offset + result * cds_record_size);
@@ -476,7 +422,7 @@ static int truename(char *dest, const char *src, int allowwildcards)
 
   d_printf("Absolute logical path: \"%s\"\n", dest);
 
-  return result;
+  return 0;
 
 errRet:
   /* The error is either PATHNOTFND or FILENOTFND
@@ -499,21 +445,27 @@ static int lfn_error(int errorcode)
 
 static int build_truename(char *dest, const char *src, int mode)
 {
-	int dd;
+	int dd = -1;
+	int err;
 
-	d_printf("LFN: build_truename: %s\n", src);
-	dd = truename(dest, src, mode);
+	d_printf("LFN: build_posix_path: %s\n", src);
+	err = truename(dest, src, mode, &dd);
 
-	if (dd < 0) {
-		lfn_error(-dd);
+	switch (err) {
+	case 0:
+		break;
+	case -DISK_DRIVE_INVALID:
+		assert(dd >= 0);
+		if (!drives[dd].root)
+			return -2;
+		/* no break */
+	default:
+		lfn_error(-err);
 		return -1;
 	}
 
-	if (src[0] == '\\' && src[1] == '\\') {
-		if (strncasecmp(src, LINUX_RESOURCE, strlen(LINUX_RESOURCE)) != 0)
-			return  -2;
-		return MAX_DRIVE - 1;
-	}
+	if (src[0] == '\\' && src[1] == '\\')
+		return -2;
 
 	if (dd >= MAX_DRIVE || !drives[dd].root)
 		return -2;
@@ -697,16 +649,9 @@ static int make_finddata(const char *fpath, uint8_t attrs,
 
 static void call_dos_helper(int ah)
 {
-	unsigned int ssp = SEGOFF2LINEAR(_SS, 0);
-	unsigned int sp = _SP;
+	fake_call_to(LFN_HELPER_SEG, LFN_HELPER_OFF);
 	_AH = ah;
-	pushw(ssp, sp, _CS);
-	pushw(ssp, sp, _IP);
-	_SP -= 4;
-	_CS = LFN_HELPER_SEG;
-	_IP = LFN_HELPER_OFF;
 }
-
 
 static int wildcard_delete(char *fpath, int drive)
 {
@@ -718,7 +663,7 @@ static int wildcard_delete(char *fpath, int drive)
 	int errcode;
 
 	slash = strrchr(fpath, '/');
-	d_printf("LFN: posix:%s\n", fpath);
+	d_printf("LFN: posix:'%s'\n", fpath);
 	if (slash - 2 > fpath && slash[-2] == '/' && slash[-1] == '.')
 		slash -= 2;
 	*slash = '\0';
@@ -726,13 +671,13 @@ static int wildcard_delete(char *fpath, int drive)
 		strcpy(fpath, "/");
 	/* XXX check for device (special dir entry) */
 	if (!find_file(fpath, &st, drive, NULL) || is_dos_device(fpath)) {
-		Debug0((dbg_fd, "Get failed: '%s'\n", fpath));
+		d_printf("LFN: Get failed: '%s'\n", fpath);
 		return lfn_error(PATH_NOT_FOUND);
 	}
 	slash = fpath + strlen(fpath);
 	dir = dos_opendir(fpath);
 	if (dir == NULL) {
-		Debug0((dbg_fd, "Get failed: '%s'\n", fpath));
+		d_printf("LFN: Get failed: '%s'\n", fpath);
 		free(dir);
 		return lfn_error(PATH_NOT_FOUND);
 	}
@@ -740,7 +685,7 @@ static int wildcard_delete(char *fpath, int drive)
 	name_ufs_to_dos(pattern, slash + 1);
 	strupperDOS(pattern);
 
-	d_printf("LFN: wildcard delete %s %s %x\n", pattern, fpath, dirattr);
+	d_printf("LFN: wildcard delete '%s' '%s' %x\n", pattern, fpath, dirattr);
 	errcode = FILE_NOT_FOUND;
 	while ((de = dos_readdir(dir))) {
 		char name_8_3[PATH_MAX];
@@ -749,7 +694,7 @@ static int wildcard_delete(char *fpath, int drive)
 			*slash = '/';
 			strcpy(slash + 1, de->d_long_name);
 
-			d_printf("LFN: wildcard delete %s\n", fpath);
+			d_printf("LFN: wildcard delete '%s'\n", fpath);
 			stat(fpath, &st);
 			/* don't remove directories */
 			if (st.st_mode & S_IFDIR)
@@ -767,8 +712,8 @@ static int wildcard_delete(char *fpath, int drive)
 			errcode = unlink(fpath);
 #endif
 			if (errcode != 0) {
-				Debug0((dbg_fd, "Delete failed(%s) %s\n",
-					strerror(errno), fpath));
+				d_printf("LFN: Delete failed(%s) '%s'\n",
+					strerror(errno), fpath);
 				free(pattern);
 				dos_closedir(dir);
 				if (errcode == EACCES) {
@@ -777,7 +722,7 @@ static int wildcard_delete(char *fpath, int drive)
 					return lfn_error(FILE_NOT_FOUND);
 				}
 			}
-			Debug0((dbg_fd, "Deleted %s\n", fpath));
+			d_printf("LFN: Deleted '%s'\n", fpath);
 		}
 	}
 	free(pattern);
@@ -818,7 +763,7 @@ static int mfs_lfn_(void)
 
 	d_printf("LFN: doing LFN!, AX=%x DL=%x\n", _AX, _DL);
 	NOCARRY;
-
+#if 0
 	if (_AH == 0x57) {
 		char *filename;
 		int fd;
@@ -826,7 +771,7 @@ static int mfs_lfn_(void)
 		if (_AL < 4 || _AL > 7) return 0;
 		filename = handle_to_filename(_BX, &fd);
 		if (filename == NULL)
-			return fd ? lfn_error(fd) : 0;
+			return 0;
 
 		if (fstat(fd, &st))
 			return lfn_error(HANDLE_INVALID);
@@ -854,6 +799,7 @@ static int mfs_lfn_(void)
 		return 1;
 	}
 	/* else _AH == 0x71 */
+#endif
 	switch (_AL) {
 	case 0x0D: /* reset drive, nothing to do */
 		break;
@@ -871,7 +817,7 @@ static int mfs_lfn_(void)
 	{
 		char *d = MK_FP32(BIOSSEG, LFN_short_name);
 		Debug0((dbg_fd, "set directory to: %s\n", src));
-		d_printf("LFN: chdir %s %zd\n", src, strlen(src));
+		d_printf("LFN: chdir '%s'\n", src);
 		drive = build_posix_path(fpath, src, 0);
 		if (drive < 0)
 			return drive + 2;
@@ -886,7 +832,7 @@ static int mfs_lfn_(void)
 		drive = build_posix_path(fpath, src, _SI);
 		if (drive < 0)
 			return drive + 2;
-		if (drives[drive].read_only)
+		if (read_only(drives[drive]))
 			return lfn_error(ACCESS_DENIED);
 		if (is_dos_device(fpath))
 			return lfn_error(FILE_NOT_FOUND);
@@ -903,11 +849,10 @@ static int mfs_lfn_(void)
 		drive = build_posix_path(fpath, src, 0);
 		if (drive < 0)
 			return drive + 2;
-		if (drives[drive].read_only && (_BL < 8) && (_BL & 1))
+		if (read_only(drives[drive]) && (_BL < 8) && (_BL & 1))
 			return lfn_error(ACCESS_DENIED);
-		if (!find_file(fpath, &st, drive, &doserrno) ||
-		    is_dos_device(fpath)) {
-			Debug0((dbg_fd, "Get failed: '%s'\n", fpath));
+		if (!find_file(fpath, &st, drive, &doserrno) || is_dos_device(fpath)) {
+			d_printf("LFN: Get failed: '%s'\n", fpath);
 			return lfn_error(doserrno);
 		}
 		utimbuf.actime = st.st_atime;
@@ -1015,15 +960,14 @@ static int mfs_lfn_(void)
 		}
 
 		/* XXX check for device (special dir entry) */
-		if (!find_file(dir->dirbase, &st, drive, NULL) ||
-		    is_dos_device(fpath)) {
-			Debug0((dbg_fd, "Get failed: '%s'\n", fpath));
+		if (!find_file(dir->dirbase, &st, drive, NULL) || is_dos_device(fpath)) {
+			d_printf("LFN: Get failed: '%s'\n", fpath);
 			free(dir);
 			return lfn_error(NO_MORE_FILES);
 		}
 		dir->dir = dos_opendir(dir->dirbase);
 		if (dir->dir == NULL) {
-			Debug0((dbg_fd, "Get failed: '%s'\n", fpath));
+			d_printf("LFN: Get failed: '%s'\n", fpath);
 			free(dir);
 			return lfn_error(NO_MORE_FILES);
 		}
@@ -1132,7 +1076,7 @@ static int mfs_lfn_(void)
 			strcat(fpath, fpath2);
 			if (!find_file(fpath, &st, drive, NULL) &&
 			    (_DX & 0x10)) {
-				if (drives[drive].read_only)
+				if (read_only(drives[drive]))
 					return lfn_error(ACCESS_DENIED);
 				strcpy(lfn_create_fpath, fpath);
 			}
@@ -1142,71 +1086,24 @@ static int mfs_lfn_(void)
 		call_dos_helper(0x6c);
 		break;
 	}
-
 	case 0xa0: /* get volume info */
-		if (!get_drive_from_path(src, &drive))
-			return lfn_error(DISK_DRIVE_INVALID);
-
-		if (!drives[drive].root)		// not MFS
-			return lfn_error(FUNCTION_NOT_SUPPORTED);
-
+		drive = build_posix_path(fpath, src, 0);
+		if (drive < 0)
+			return drive + 2;
 		size = _CX;
 		_AX = 0;
-		/*
-		 * Bit(s) Description     (Table 01783)
-		 * 0      searches are case sensitive
-		 * 1      preserves case in directory entries
-		 * 2      uses Unicode characters in file and directory names
-		 * 3-13   reserved (0)
-		 * 14     supports DOS long filename functions
-		 * 15     volume is compressed
-		 */
-		_BX = 0b0100000000000010;
+		_BX = 0x4002;
 		_CX = 255;
 		_DX = 260;
 		if (size >= 4)
 			MEMCPY_2DOS(dest, "MFS", 4);
 		break;
-
 	case 0xa1: /* findclose */
 		d_printf("LFN: findclose %x\n", _BX);
 		return close_dirhandle(_BX);
-	case 0xa6: { /* get file info by handle */
-		int fd;
-		char *filename;
-		unsigned long long wtime;
-		unsigned int buffer = SEGOFF2LINEAR(_DS, _DX);
-
-		d_printf("LFN: get file info by handle %x\n", _BX);
-		filename = handle_to_filename(_BX, &fd);
-		if (filename == NULL)
-			return fd ? lfn_error(fd) : 0;
-
-		if (fstat(fd, &st))
-			return lfn_error(HANDLE_INVALID);
-		d_printf("LFN: handle function for BX=%x, path=%s, fd=%d\n",
-			 _BX, filename, fd);
-
-		WRITE_DWORD(buffer, get_dos_attr_fd(fd, st.st_mode,
-						    is_hidden(filename)));
-		wtime = unix_to_win_time(st.st_ctime);
-		WRITE_DWORD(buffer + 4, wtime);
-		WRITE_DWORD(buffer + 8, wtime >> 32);
-		wtime = unix_to_win_time(st.st_atime);
-		WRITE_DWORD(buffer + 0xc, wtime);
-		WRITE_DWORD(buffer + 0x10, wtime >> 32);
-		wtime = unix_to_win_time(st.st_mtime);
-		WRITE_DWORD(buffer + 0x14, wtime);
-		WRITE_DWORD(buffer + 0x18, wtime >> 32);
-		WRITE_DWORD(buffer + 0x1c, st.st_dev); /*volume serial number*/
-		WRITE_DWORD(buffer + 0x20, (unsigned long long)st.st_size >> 32);
-		WRITE_DWORD(buffer + 0x24, st.st_size);
-		WRITE_DWORD(buffer + 0x28, st.st_nlink);
-		/* fileid*/
-		WRITE_DWORD(buffer + 0x2c, (unsigned long long)st.st_ino >> 32);
-		WRITE_DWORD(buffer + 0x30, st.st_ino);
-		return 0;
-	}
+	case 0xa6: /* get file info by handle */
+		fake_call_to(LFN_HELPER_SEG, LFN_A6_HELPER_OFF);
+		break;
 	case 0xa7: /* file time to DOS time and v.v. */
 		if (_BL == 0) {
 			src = MK_FP32(_DS, _SI);

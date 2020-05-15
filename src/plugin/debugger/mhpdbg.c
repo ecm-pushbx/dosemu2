@@ -104,10 +104,14 @@ void mhp_close(void)
      mhp_send();
    }
    remove_from_io_select(mhpdbg.fdin);
-   unlink(pipename_in);
-   free(pipename_in);
-   unlink(pipename_out);
-   free(pipename_out);
+   if (pipename_in) {
+     unlink(pipename_in);
+     free(pipename_in);
+   }
+   if (pipename_out) {
+     unlink(pipename_out);
+     free(pipename_out);
+   }
    mhpdbg.fdin = mhpdbg.fdout = -1;
    mhpdbg.active = 0;
 }
@@ -156,8 +160,8 @@ static void mhp_init(void)
     if (!retval) {
       mhpdbg.fdin = open(pipename_in, O_RDONLY | O_NONBLOCK);
       if (mhpdbg.fdin != -1) {
-        /* NOTE: need to open read/write else O_NONBLOCK would fail to open */
-        mhpdbg.fdout = open(pipename_out, O_RDWR | O_NONBLOCK);
+        /* NOTE: need to open read/write else it will block */
+        mhpdbg.fdout = open(pipename_out, O_RDWR);
         if (mhpdbg.fdout != -1) {
           add_to_io_select(mhpdbg.fdin, mhp_input_async, NULL);
         }
@@ -168,9 +172,8 @@ static void mhp_init(void)
       }
     }
   }
-  else {
+  if (retval || mhpdbg.fdin == -1 || mhpdbg.fdout == -1)
     fprintf(stderr, "Can't create debugger pipes, dosdebug not available\n");
-  }
   if (mhpdbg.fdin == -1) {
     unlink(pipename_in);
     free(pipename_in);
@@ -228,13 +231,8 @@ static void mhp_poll_loop(void)
    }
    in_poll_loop++;
    for (;;) {
-      int ostopped;
       handle_signals();
-      /* hack: set stopped to 1 to not allow DPMI to run */
-      ostopped = mhpdbgc.stopped;
-      mhpdbgc.stopped = 1;
       coopth_run();
-      mhpdbgc.stopped = ostopped;
       /* NOTE: if there is input on mhpdbg.fdin, as result of handle_signals
        *       io_select() is called and this then calls mhp_input.
        *       ( all clear ? )
@@ -283,6 +281,8 @@ static void mhp_poll_loop(void)
 
 static void mhp_pre_vm86(void)
 {
+    if (!mhpdbg.active)
+	return;
     if (isset_TF()) {
 	if (mhpdbgc.trapip != mhp_getcsip_value()) {
 	    mhpdbgc.trapcmd = 0;
@@ -290,6 +290,8 @@ static void mhp_pre_vm86(void)
 	    mhp_poll();
 	}
     }
+    if (mhpdbgc.stopped)
+	mhp_poll();
 }
 
 static void mhp_poll(void)
@@ -351,7 +353,7 @@ void mhp_intercept(const char *msg, const char *logflags)
    mhpdbgc.stopped = 1;
    mhpdbgc.want_to_stop = 0;
    traceloop = 0;
-   mhp_printf(msg);
+   mhp_printf("%s", msg);
    mhp_cmd("r0");
    mhp_send();
    if (!(dosdebug_flags & DBGF_IN_LEAVEDOS)) {
@@ -386,7 +388,6 @@ unsigned int mhp_debug(enum dosdebug_event code, unsigned int parm1, unsigned in
   return rtncd;
 #endif
   mhpdbgc.currcode = code;
-  mhp_bpclr();
   switch (DBG_TYPE(mhpdbgc.currcode)) {
   case DBG_INIT:
 	  mhp_init();
@@ -399,26 +400,21 @@ unsigned int mhp_debug(enum dosdebug_event code, unsigned int parm1, unsigned in
 	     break;
 	  if (test_bit(DBG_ARG(mhpdbgc.currcode), mhpdbg.intxxtab)) {
 	    if ((mhpdbgc.bpload==1) && (DBG_ARG(mhpdbgc.currcode) == 0x21) && (LWORD(eax) == 0x4b00) ) {
-
-	      /* mhpdbgc.bpload_bp=((long)SREG(cs) << 4) +LWORD(eip); */
 	      mhpdbgc.bpload_bp = SEGOFF2LINEAR(SREG(cs), LWORD(eip));
 	      if (mhp_setbp(mhpdbgc.bpload_bp)) {
-		mhp_printf("bpload: intercepting EXEC\n", SREG(cs), REG(eip));
-		/*
+		mhp_printf("bpload: intercepting EXEC\n");
 		mhp_cmd("r");
-		mhp_cmd("d ss:sp 30h");
-		*/
-
+		mhp_bpset();
 		mhpdbgc.bpload++;
 		mhpdbgc.bpload_par = MK_FP32(BIOSSEG, DBGload_parblock);
 		MEMCPY_2UNIX(mhpdbgc.bpload_par, SEGOFF2LINEAR(SREG(es), LWORD(ebx)), 14);
 		MEMCPY_2UNIX(mhpdbgc.bpload_cmdline, PAR4b_addr(commandline_ptr), 128);
 		MEMCPY_2UNIX(mhpdbgc.bpload_cmd, SEGOFF2LINEAR(SREG(ds), LWORD(edx)), 128);
-		SREG(es)=BIOSSEG;
-		LWORD(ebx)=(char *)mhpdbgc.bpload_par - (char *)MK_FP32(BIOSSEG, 0);
-		LWORD(eax)=0x4b01; /* load, but don't execute */
-	      }
-	      else {
+
+		SREG(es) = BIOSSEG;
+		LWORD(ebx) = DBGload_parblock;
+		LWORD(eax) = 0x4b01; /* load, but don't execute */
+	      } else {
 		mhp_printf("bpload: ??? #1\n");
 		mhp_cmd("r");
 
@@ -440,7 +436,14 @@ unsigned int mhp_debug(enum dosdebug_event code, unsigned int parm1, unsigned in
 	        if (parm1)
 	          LWORD(eip) -= 2;
 	        mhpdbgc.int_handled = 0;
-	        mhp_poll();
+	        if (!parm2) {
+	          mhp_poll();
+	          /* let dosemu call do_int() and get back */
+	          if (mhpdbgc.trapcmd)
+		    mhpdbgc.stopped = 1;
+		} else {
+		  mhp_cmd("r0");
+		}
 	        if (mhpdbgc.int_handled)
 	          rtncd = 1;
 	        else if (parm1)
@@ -467,10 +470,10 @@ unsigned int mhp_debug(enum dosdebug_event code, unsigned int parm1, unsigned in
 			  /* no break */
 		  case 1: /* ti command */
 			  mhpdbgc.trapcmd = 0;
-			  rtncd = 1;
 			  mhpdbgc.stopped = 1;
 			  break;
 		  }
+		  rtncd = 1;	// suppress int 1
 
 		  if (traceloop && mhp_bpchk(mhp_getcsip_value())) {
 			  traceloop = 0;
@@ -483,14 +486,24 @@ unsigned int mhp_debug(enum dosdebug_event code, unsigned int parm1, unsigned in
 		  unsigned int csip=mhp_getcsip_value() - 1;
 		  if (mhpdbgc.bpload_bp == csip ) {
 		    /* mhp_cmd("r"); */
-		    mhp_clearbp(mhpdbgc.bpload_bp);
-		    mhp_modify_eip(-1);
-		    if (mhpdbgc.bpload == 2) {
-		      mhp_printf("bpload: INT3 caught\n");
+		    switch (mhpdbgc.bpload) {
+		    case 2:
+		      mhp_modify_eip(-1);
+		      mhp_printf("bpload: INT3 caught at %x:%x\n", _CS, _IP);
 		      SREG(cs)=BIOSSEG;
 		      LWORD(eip) = DBGload_OFF;
 		      mhpdbgc.trapcmd = 1;
+		      mhpdbgc.bpload++;
+		      break;
+		    case 3:
+		      mhp_clearbp(mhpdbgc.bpload_bp);
+		      mhp_modify_eip(-1);
+		      mhp_printf("bpload: program exited\n");
 		      mhpdbgc.bpload = 0;
+		      ok = 1;
+		      break;
+		    default:
+		      error("wrong bpload state %i\n", mhpdbgc.bpload);
 		    }
 		  }
 		  else {
@@ -528,7 +541,6 @@ unsigned int mhp_debug(enum dosdebug_event code, unsigned int parm1, unsigned in
   default:
 	  break;
   }
-  if (mhpdbg.active) mhp_bpset();
   return rtncd;
 }
 

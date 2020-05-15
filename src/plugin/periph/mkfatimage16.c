@@ -24,14 +24,18 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <string.h>
+#include <assert.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "disks.h"
 //#include "doshelpers.h"
-#include "bootsect.h"
-#include "bootnorm.h"
+
+#include "bootnorm.xxd"
+#include "bootsect.xxd"
+
+#define MIN(a,b) (((a)<(b))?(a):(b))
 
 
 /* These can be changed -- at least in theory. In practise, it doesn't
@@ -151,7 +155,7 @@ static void put_root_directory(int n, struct input_file *f)
   unsigned char *p = &root_directory[n*32];
   struct tm *tm;
   tm = localtime(&f->mtime);
-  put_word(&p[24], (((tm->tm_year - 80) & 0x1f) << 9) |
+  put_word(&p[24], (((tm->tm_year - 80) & 0b01111111) << 9) |
     (((tm->tm_mon + 1) & 0xf) << 5) |
     (tm->tm_mday & 0x1f));
   put_word(&p[22], ((tm->tm_hour & 0x1f) << 11) |
@@ -168,9 +172,10 @@ static void put_root_directory(int n, struct input_file *f)
  */
 static void add_input_file(char *filename)
 {
-  char tmp[14], *base, *ext, *p;
+  char tmp[13], *base, *ext, *p;
   struct stat s;
   struct input_file *i = &input_files[input_file_count];
+  int n;
 
   /* Check that the root directory isn't full (also count volume label). */
   if (input_file_count >= (ROOT_DIRECTORY_ENTRIES-1))
@@ -200,7 +205,8 @@ static void add_input_file(char *filename)
     fprintf(stderr, "%s: File name is not DOS-compatible\n", filename);
     return;
   }
-  sprintf(i->dos_filename, "%-8s%-3s", base, ext);
+  n = snprintf(i->dos_filename, 12, "%-8s%-3s", base, ext);
+  assert(n < 12);
   for (p = i->dos_filename; (*p != '\0'); p++)
     *p = toupper(*p);
   i->filename = strdup(filename);
@@ -389,7 +395,7 @@ int main(int argc, char *argv[])
   }
   /* Write our master boot record */
   clear_buffer();
-  memcpy(buffer, bootnormal_code, bootnormal_code_end - bootnormal_code);
+  memcpy(buffer, bootnorm_code, MIN(sizeof(buffer), sizeof(bootnorm_code)));
 #if 0
   buffer[0] = 0xeb;                     /* Jump to dosemu exit code. */
   buffer[1] = 0x3c;                     /* (jmp 62; nop) */
@@ -435,7 +441,7 @@ int main(int argc, char *argv[])
   }
   if (!bootsect_file) {
     clear_buffer();
-    memcpy(buffer, boot_sect, boot_sect_end - boot_sect);
+    memcpy(buffer, bootsect_code, MIN(sizeof(buffer), sizeof(bootsect_code)));
   }
 
   bpb = (struct on_disk_bpb *) &buffer[0x0b];

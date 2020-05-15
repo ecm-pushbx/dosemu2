@@ -26,6 +26,7 @@ typedef enum {
 
 const char *disk_t_str(disk_t t);
 
+
 #define DISK_RDWR	0
 #define DISK_RDONLY	1
 
@@ -108,6 +109,7 @@ struct disk {
   int hdtype;			/* 0 none, IBM Types 1, 2 and 9 */
   floppy_t default_cmos;	/* default CMOS floppy type */
   int drive_num;
+  int log_offs;
   unsigned long serial;		/* serial number */
   disk_t type;			/* type of file: image, partition, disk */
   off_t header;			/* compensation for opt. pre-disk header */
@@ -165,6 +167,20 @@ extern struct disk disktab[MAX_FDISKS];
  */
 extern struct disk hdisktab[MAX_HDISKS];
 
+extern struct disk *hdisk_find(uint8_t num);
+extern struct disk *hdisk_find_by_path(const char *path);
+
+#define HDISK_NUM(i) ({ assert(hdisktab[i].drive_num & 0x80); \
+    (hdisktab[i].drive_num & 0x7f) + 2; })
+
+#define FOR_EACH_HDISK(i, c) do { \
+    for (i = 0; i < MAX_HDISKS; i++) { \
+        if (!hdisktab[i].drive_num) \
+            continue; \
+        c \
+    } \
+} while (0)
+
 #if 1
 #ifdef __linux__
 #define DISK_OFFSET(dp,h,s,t) \
@@ -178,8 +194,8 @@ extern struct disk hdisktab[MAX_HDISKS];
   (((h * dp->tracks + t) * dp->sectors + s) * SECTOR_SIZE)
 #endif
 
-int read_mbr(struct disk *dp, unsigned buffer);
-int read_sectors(struct disk *, unsigned, uint64_t, long);
+int read_mbr(const struct disk *dp, unsigned buffer);
+int read_sectors(const struct disk *, unsigned, uint64_t, long);
 int write_sectors(struct disk *, unsigned, uint64_t, long);
 
 void disk_open(struct disk *dp);

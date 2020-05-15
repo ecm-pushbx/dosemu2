@@ -53,6 +53,7 @@ static int do_set_dosenv (int agrc, char **argv);
 static void do_parse_vars(const char *str, char drv, int parent);
 
 static char e_drv;
+static int vars_parsed;
 
 int system_main(int argc, char **argv)
 {
@@ -72,10 +73,6 @@ int system_main(int argc, char **argv)
 #if CAN_EXECUTE_DOS
     case 'e':
       /* Execute the DOS command given in dosemu command line with -E or -K */
-      if (unix_e_welcome) {
-	show_welcome_screen();
-	unix_e_welcome = 0;
-      }
       is_e = 1;
       break;
     case 'r':
@@ -156,8 +153,12 @@ static int setupDOSCommand(const char *linux_path, int n_up, char *r_drv)
   char *path1, *p;
   char drvStr[3];
 
-  drive = find_free_drive();
+  drive = com_FindFreeDrive();
   if (drive < 0) {
+    if (config.boot_freedos) {
+      error("exec via linux path is not supported with this freedos version\n");
+      leavedos(26);
+    }
     com_fprintf (com_stderr,
                      "ERROR: Cannot find a free DOS drive to use for LREDIR\n");
     return (1);
@@ -333,7 +334,7 @@ static void _do_parse_vars(char *str, char drv, int parent)
     if (p0) {
       /* %O expands to old value */
       if ((sub = strstr(p, "%O"))) {
-        char *old = parent ? mgetenv(p0) : mgetenv_child(p0);
+        char *old = mgetenv(p0);
         int offs = sub - p;
         if (old)
           snprintf(buf, sizeof(buf), "%.*s%s%s", offs, p, old, p + offs + 2);
@@ -368,35 +369,40 @@ static int do_prepare_exec(int argc, char **argv, char *r_drv)
   if (config.unix_path) {
     if (setupDOSCommand(config.unix_path, config.cdup, r_drv))
       return 1;
-    if (!config.dos_cmd) {
-      msetenv("DOSEMU_KEEPDRV", "1");  // nothing to execute, only chdir
-      return 0;
-    }
-  } else {
-    if (!config.dos_cmd)
-      return 0;		// nothing to execute
   }
+  if (!config.dos_cmd)
+    return 0;		// nothing to execute
 
   return 2;
 }
 
 static int do_execute_cmdline(int argc, char **argv, int parent)
 {
-  char *vars, drv;
-  int ret;
+  char *vars, drv = e_drv;
+  int ret = 2, first = 0;
 
-  ret = do_prepare_exec(argc, argv, &drv);
+  if (!e_drv) {
+    ret = do_prepare_exec(argc, argv, &drv);
+    e_drv = drv;  // store for later -p
+    first = 1;
+  }
   vars = misc_e6_options();
   if (vars) {
     uint16_t ppsp = com_parent_psp_seg();
     /* if we have a parent then we are not command.com (hack) */
     if (ppsp && ppsp != com_psp_seg()) {
-      if (parent)
+      if (parent && first) {
         do_parse_vars(vars, drv, 1);
-      mresize_env(strlen(vars));
+        vars_parsed = 1;
+      }
+      if (!vars_parsed || first) {
+        mresize_env(strlen(vars));
+        do_parse_vars(vars, drv, 0);
+      }
+    } else if (first) {
+      do_parse_vars(vars, drv, 0);
+      vars_parsed = 1;
     }
-    do_parse_vars(vars, drv, 0);
-    e_drv = drv;	// store for later -p
   }
   if (ret == 2)
     ret = do_system(config.dos_cmd, config.exit_on_cmd);

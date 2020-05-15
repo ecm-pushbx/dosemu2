@@ -158,7 +158,7 @@ void uart_clear_fifo(int num, int fifo)
 static int get_rx(int num)
 {
   int val;
-  com[num].rx_timeout = TIMEOUT_RX;		/* Reset timeout counter */
+  com[num].rx_timeout = 0;		/* Reset timeout counter */
   com[num].IIR.flg.cti = 0;
 
   /* if no data, try to get some */
@@ -329,7 +329,7 @@ static void put_tx(int num, char val)
   }
   /* Else, not in loopback mode */
 
-  if (!(com[num].LSR & UART_LSR_THRE)) {
+  if (!FIFO_ENABLED(num) && !(com[num].LSR & UART_LSR_THRE)) {
     s_printf("SER%d: ERROR: TX overrun\n", num);
     /* no indication bit for this??? */
     return;
@@ -531,6 +531,8 @@ put_lsr(int num, int val)
     if(s3_printf) s_printf("SER%d: Func put_lsr caused int_type = %d\n",num,int_type);
     serial_int_engine(num, int_type);
   }
+  /* need to sync back DR */
+  receive_engine(num, 0);
 }
 
 
@@ -704,7 +706,8 @@ do_serial_out(int num, ioport_t address, int val)
     break;
 
   case UART_FCR:	/* Write to FIFO Control Register */
-    if(s1_printf) s_printf("SER%d: FCR = 0x%x\n",num,val);
+    if(s1_printf) s_printf("SER%d: FCR = 0x%x -> 0x%x\n", num,
+        com[num].FCReg, val);
     put_fcr(num, val);
     break;
 
@@ -714,22 +717,26 @@ do_serial_out(int num, ioport_t address, int val)
     break;
 
   case UART_MCR:	/* Write to Modem Control Register */
-    if(s1_printf) s_printf("SER%d: MCR = 0x%x\n",num,val);
+    if(s1_printf) s_printf("SER%d: MCR = 0x%x -> 0x%x\n", num,
+        com[num].MCR, val);
     put_mcr(num, val);
     break;
 
   case UART_LSR:	/* Write to Line Status Register */
+    if(s1_printf) s_printf("SER%d: LSR = 0x%x -> 0x%x\n", num,
+        com[num].LSR, val);
     put_lsr(num, val);		/* writeable only to lower 6 bits */
-    if(s1_printf) s_printf("SER%d: LSR = 0x%x -> 0x%x\n",num,val,com[num].LSR);
     break;
 
   case UART_MSR:	/* Write to Modem Status Register */
+    if(s1_printf) s_printf("SER%d: MSR = 0x%x -> 0x%x\n", num,
+        com[num].MSR, val);
     put_msr(num, val);		/* writeable only to lower 4 bits */
-    if(s1_printf) s_printf("SER%d: MSR = 0x%x -> 0x%x\n",num,val,com[num].MSR);
     break;
 
   case UART_SCR:	/* Write to Scratch Register */
-    if(s1_printf) s_printf("SER%d: SCR = 0x%x\n",num,val);
+    if(s1_printf) s_printf("SER%d: SCR = 0x%x -> 0x%x\n", num,
+        com[num].SCR, val);
     com[num].SCR = val;
     break;
 

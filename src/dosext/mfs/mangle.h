@@ -6,6 +6,8 @@ March 1995
 Modified by O.V.Zhirov, July 1998
 */
 
+#include "memory.h"
+
 #if defined(__linux__)
 #define DOSEMU 1		/* this is a port to dosemu */
 #endif
@@ -37,14 +39,15 @@ typedef char pstring[1024];
 
 
 /* prototypes */
-extern unsigned int is_dos_device(const char *fname);
+extern dosaddr_t is_dos_device(const char *fname);
 extern BOOL do_fwd_mangled_map(char *s, char *MangledMap);
 extern BOOL name_convert(char *Name,BOOL mangle);
 extern BOOL is_mangled(const char *s);
 extern BOOL check_mangled_stack(char *s, char *MangledMap);
 
 /* prototypes, found in util.c */
-extern unsigned char unicode_to_dos_table[0x10000];
+#include "keyboard/keystate.h"
+#define unicode_to_dos_table(sym) (dos_keyboard_state.rules->charset.keys[sym].character)
 
 BOOL isupperDOS(int c);
 BOOL islowerDOS(int c);

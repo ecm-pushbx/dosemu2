@@ -50,21 +50,17 @@
 #include "utilities.h"
 #include "dpmi.h"
 
-#define TAP_DEVICE  "tap%d"
-
 static void pkt_hlt(Bit16u idx, void *arg);
-static int Open_sockets(char *name);
-static int Insert_Type(int, int, char *);
+static int Insert_Type(int, int, Bit8u *);
 static int Remove_Type(int);
 int Find_Handle(u_char *buf);
 static void printbuf(const char *, struct ethhdr *);
 static int pkt_check_receive(int ilevel);
 static void pkt_receiver_callback(void);
 static void pkt_receiver_callback_thr(void *arg);
+static void pkt_register_net_fd_and_mode(int fd, int mode);
 static Bit32u PKTRcvCall_TID;
 static Bit16u pkt_hlt_off;
-
-static int pktdrvr_installed;
 
 static unsigned short receive_mode;
 static unsigned short local_receive_mode;
@@ -96,7 +92,7 @@ struct per_handle
 	int flags;			/* per-packet-type flags */
 	int sock;			/* fd for the socket */
 	Bit16u rcvr_cs, rcvr_ip;	/* receive handler */
-	char packet_type[16];		/* packet type for this handle */
+	Bit8u packet_type[16];		/* packet type for this handle */
 };
 
 struct pkt_globs
@@ -123,53 +119,11 @@ struct pkt_statistics *p_stats;
 /* initialize the packet driver interface (called at startup) */
 void pkt_priv_init(void)
 {
-    int ret = -1;
-    /* initialize the globals */
     if (!config.pktdrv)
       return;
 
+    /* initialize the globals */
     LibpacketInit();
-
-    /* call Open_sockets() only for priv configs */
-    switch (config.vnet) {
-      case VNET_TYPE_ETH:
-	pd_printf("PKT: Using ETH device %s\n", config.ethdev);
-	ret = Open_sockets(config.ethdev);
-	if (ret < 0)
-	  error("PKT: Cannot open %s: %s\n", config.ethdev, strerror(errno));
-	break;
-      case VNET_TYPE_AUTO:
-      case VNET_TYPE_TAP: {
-	int vnet = config.vnet;
-	char devname[256];
-	int tap_auto = 0;
-        if (!config.tapdev || !config.tapdev[0]) {
-	  pd_printf("PKT: Using dynamic TAP device\n");
-	  strcpy(devname, TAP_DEVICE);
-	  tap_auto = 1;
-	} else {
-	  pd_printf("PKT: trying to bind to TAP device %s\n", config.tapdev);
-	  strcpy(devname, config.tapdev);
-	}
-	config.vnet = VNET_TYPE_TAP;
-	ret = Open_sockets(devname);
-	if (ret < 0) {
-	  if (vnet != VNET_TYPE_AUTO) {
-	    error("PKT: Cannot open %s: %s\n", devname, strerror(errno));
-	  } else {
-	    pd_printf("PKT: Cannot open %s: %s\n", devname, strerror(errno));
-	    if (!tap_auto || can_do_root_stuff)
-	      error("PKT: Cannot open TAP %s (%s), will try VDE\n",
-	          devname, strerror(errno));
-	  }
-	  config.vnet = vnet;
-	}
-	break;
-      }
-    }
-
-    if (ret != -1)
-	pktdrvr_installed = 1;
 }
 
 void
@@ -184,38 +138,11 @@ pkt_init(void)
     hlt_hdlr.func       = pkt_hlt;
     pkt_hlt_off = hlt_register_handler(hlt_hdlr);
 
-    /* call Open_sockets() only for non-priv configs */
-    if (!pktdrvr_installed) {
-      switch (config.vnet) {
-      case VNET_TYPE_AUTO:
-	pkt_set_flags(PKT_FLG_QUIET);
-	/* no break */
-      case VNET_TYPE_VDE: {
-	int vnet = config.vnet;
-	const char *pr_dev = config.vdeswitch[0] ? config.vdeswitch : "(auto)";
-	if (!pkt_is_registered_type(VNET_TYPE_VDE)) {
-	  if (vnet != VNET_TYPE_AUTO)
-	    error("vde support is not compiled in\n");
-	  break;
-	}
-	config.vnet = VNET_TYPE_VDE;
-	ret = Open_sockets(config.vdeswitch);
-	if (ret < 0) {
-	  if (vnet == VNET_TYPE_AUTO)
-	    warn("PKT: Cannot run VDE %s\n", pr_dev);
-	  else
-	    error("Unable to run VDE %s\n", pr_dev);
-	  config.vnet = vnet;
-	} else {
-	  pktdrvr_installed = 1;
-	  pd_printf("PKT: Using device %s\n", pr_dev);
-	}
-	break;
-      }
-      }
-    }
-    if (!pktdrvr_installed)
+    ret = OpenNetworkLink(pkt_register_net_fd_and_mode);
+    if (ret < 0) {
+      config.pktdrv = 0;
       return;
+    }
 
     p_param = MK_FP32(BIOSSEG, PKTDRV_param);
     p_stats = MK_FP32(BIOSSEG, PKTDRV_stats);
@@ -246,12 +173,10 @@ void
 pkt_reset(void)
 {
     int handle;
-    if (!config.pktdrv || !pktdrvr_installed)
+    if (!config.pktdrv)
       return;
     WRITE_WORD(SEGOFF2LINEAR(PKTDRV_SEG, PKTDRV_driver_entry_ip), pkt_hlt_off);
     WRITE_WORD(SEGOFF2LINEAR(PKTDRV_SEG, PKTDRV_driver_entry_cs), BIOS_HLT_BLK_SEG);
-    /* hook the interrupt vector by pointing it into the magic table */
-    SETIVEC(0x60, PKTDRV_SEG, PKTDRV_OFF);
 
     max_pkt_type_array = 0;
     for (handle = 0; handle < MAX_HANDLE; handle++)
@@ -260,7 +185,7 @@ pkt_reset(void)
 
 void pkt_term(void)
 {
-    if (!config.pktdrv || !pktdrvr_installed)
+    if (!config.pktdrv)
       return;
     remove_from_io_select(pkt_fd);
     CloseNetworkLink(pkt_fd);
@@ -273,7 +198,7 @@ static int pkt_int(void)
     int hdlp_handle=-1;
 
     /* If something went wrong in pkt_init, pretend we are not there. */
-    if (!pktdrvr_installed)
+    if (!config.pktdrv)
 	return 0;
 
 #if 1
@@ -572,7 +497,7 @@ static void pkt_receive_req_async(void *arg)
 	pic_request(PIC_NET);
 }
 
-void pkt_register_net_fd_and_mode(int fd, unsigned short mode)
+static void pkt_register_net_fd_and_mode(int fd, int mode)
 {
     pkt_fd = fd;
     add_to_io_select(pkt_fd, pkt_receive_req_async, NULL);
@@ -581,20 +506,9 @@ void pkt_register_net_fd_and_mode(int fd, unsigned short mode)
     pd_printf("PKT: detected receive mode %i\n", mode);
 }
 
-static int
-Open_sockets(char *name)
-{
-    /* The socket for normal packets */
-    int ret = OpenNetworkLink(name);
-    if (ret < 0)
-	return ret;
-
-    return 0;
-}
-
 /* register a new packet type */
 static int
-Insert_Type(int handle, int pkt_type_len, char *pkt_type)
+Insert_Type(int handle, int pkt_type_len, Bit8u *pkt_type)
 {
     int i, nchars;
     if(pkt_type_len > MAX_PKT_TYPE_SIZE) return -1;
@@ -642,12 +556,7 @@ Remove_Type(int handle)
 
 static void pkt_receiver_callback(void)
 {
-    if (p_helper_size == 0)
-      return;
-
-    if(in_dpmi_pm())
-	fake_pm_int();
-    fake_int_to(BIOSSEG, EOI_OFF);
+    assert(p_helper_size);
     coopth_start(PKTRcvCall_TID, pkt_receiver_callback_thr, NULL);
 }
 
@@ -684,7 +593,7 @@ static int pkt_receive(void)
     int size, handle;
     struct per_handle *hdlp;
 
-    if (!pktdrvr_installed) {
+    if (!config.pktdrv) {
         pd_printf("Driver not initialized ...\n");
 	return 0;
     }

@@ -234,10 +234,15 @@ int SDL_init(void)
   Uint32 rm, gm, bm, am;
 
   assert(pthread_equal(pthread_self(), dosemu_pthread_self));
+
+  /* hints are set before renderer is created */
   if (config.X_lin_filt || config.X_bilin_filt) {
     v_printf("SDL: enabling scaling filter\n");
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
   }
+#if SDL_VERSION_ATLEAST(2,0,10)
+  SDL_SetHint(SDL_HINT_RENDER_BATCHING, "1");
+#endif
   flags |= SDL_WINDOW_RESIZABLE;
 #if 0
   /* some SDL bug prevents resizing if the window was created with this
@@ -474,7 +479,7 @@ static void sync_mouse_coords(void)
   int m_x, m_y;
 
   SDL_GetMouseState(&m_x, &m_y);
-  mouse_move_absolute(m_x, m_y, m_x_res, m_y_res);
+  mouse_move_absolute(m_x, m_y, m_x_res, m_y_res, MOUSE_SDL);
 }
 
 static void update_mouse_coords(void)
@@ -515,6 +520,7 @@ static void SDL_change_mode(int x_res, int y_res, int w_x_res, int w_y_res)
     texture_buf = NULL;
   }
 
+  pthread_mutex_lock(&rend_mtx);
   if (config.X_fixed_aspect)
     SDL_RenderSetLogicalSize(renderer, w_x_res, w_y_res);
   flags = SDL_GetWindowFlags(window);
@@ -538,6 +544,7 @@ static void SDL_change_mode(int x_res, int y_res, int w_x_res, int w_y_res)
     SDL_SetRenderTarget(renderer, texture_buf);
     SDL_RenderClear(renderer);
   }
+  pthread_mutex_unlock(&rend_mtx);
 
   m_x_res = w_x_res;
   m_y_res = w_y_res;
@@ -588,7 +595,7 @@ static void window_grab(int on, int kbd)
     v_printf("SDL: mouse grab activated\n");
     SDL_ShowCursor(SDL_DISABLE);
     SDL_SetRelativeMouseMode(SDL_TRUE);
-    mouse_enable_native_cursor(1);
+    mouse_enable_native_cursor(1, MOUSE_SDL);
     kbd_grab_active = kbd;
   } else {
     v_printf("SDL: grab released\n");
@@ -596,7 +603,7 @@ static void window_grab(int on, int kbd)
     if (m_cursor_visible)
       SDL_ShowCursor(SDL_ENABLE);
     SDL_SetRelativeMouseMode(SDL_FALSE);
-    mouse_enable_native_cursor(0);
+    mouse_enable_native_cursor(0, MOUSE_SDL);
     kbd_grab_active = 0;
     sync_mouse_coords();
   }
@@ -619,13 +626,11 @@ static void toggle_fullscreen_mode(void)
       window_grab(1, 1);
       force_grab = 1;
     }
-    /* this lock avoids crash but shouldn't be needed */
     pthread_mutex_lock(&rend_mtx);
     SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN_DESKTOP);
     pthread_mutex_unlock(&rend_mtx);
   } else {
     v_printf("SDL: entering windowed mode!\n");
-    /* this lock avoids crash but shouldn't be needed */
     pthread_mutex_lock(&rend_mtx);
     SDL_SetWindowFullscreen(window, 0);
     pthread_mutex_unlock(&rend_mtx);
@@ -763,7 +768,13 @@ static void SDL_handle_events(void)
   assert(pthread_equal(pthread_self(), dosemu_pthread_self));
   if (render_is_updating())
     return;
-  while (SDL_PollEvent(&event)) {
+  /* events may resize renderer, so lock */
+  pthread_mutex_lock(&rend_mtx);
+  SDL_PumpEvents();
+  pthread_mutex_unlock(&rend_mtx);
+  /* SDL_PeepEvents() is thread-safe, SDL_PollEvent() - not */
+  while (SDL_PeepEvents(&event, 1, SDL_GETEVENT, SDL_FIRSTEVENT,
+	SDL_LASTEVENT) > 0) {
     switch (event.type) {
 
     case SDL_WINDOWEVENT:
@@ -799,16 +810,37 @@ static void SDL_handle_events(void)
         /* ignore fake enter events */
         if (config.X_fullscreen)
           break;
-        mouse_drag_to_corner(m_x_res, m_y_res);
+        mouse_drag_to_corner(m_x_res, m_y_res, MOUSE_SDL);
         break;
+      }
+      break;
+
+    case SDL_TEXTINPUT:
+      {
+	SDL_Event key_event;
+	int rc;
+
+	k_printf("SDL: TEXTINPUT event before KEYDOWN\n");
+	do
+	  rc = SDL_PeepEvents(&key_event, 1, SDL_GETEVENT, SDL_KEYDOWN,
+		SDL_KEYDOWN);
+	while (rc == 1 && event.text.timestamp != key_event.key.timestamp);
+	if (rc != 1) {
+	  error("SDL: missing key event\n");
+	  break;
+	}
+	SDL_process_key_text(key_event.key, event.text);
       }
       break;
 
     case SDL_KEYDOWN:
       {
+	SDL_Event text_event;
+	int rc;
+	SDL_Keysym keysym = event.key.keysym;
+
 	if (wait_kup)
 	  break;
-	SDL_Keysym keysym = event.key.keysym;
 	if ((keysym.mod & KMOD_CTRL) && (keysym.mod & KMOD_ALT)) {
 	  if (keysym.sym == SDLK_HOME || keysym.sym == SDLK_k) {
 	    force_grab = 0;
@@ -830,18 +862,28 @@ static void SDL_handle_events(void)
 	  if (!m_cursor_visible)
 	    SDL_ShowCursor(SDL_ENABLE);
 	}
-      }
 #if CONFIG_SDL_SELECTION
-      clear_if_in_selection();
+	clear_if_in_selection();
 #endif
-#ifdef X_SUPPORT
-#if _HAVE_XKB
-      if (x11_display && config.X_keycode)
-	SDL_process_key_xkb(x11_display, event.key);
-      else
-#endif
-#endif
-	SDL_process_key(event.key);
+	do
+	  rc = SDL_PeepEvents(&text_event, 1, SDL_GETEVENT, SDL_TEXTINPUT,
+		SDL_TEXTINPUT);
+	while (rc == 1 && event.key.timestamp != text_event.text.timestamp);
+	if (rc == 1) {
+	    SDL_Event key_event;
+	    int rc2 = SDL_PeepEvents(&key_event, 1, SDL_PEEKEVENT, SDL_KEYDOWN,
+		    SDL_KEYDOWN);
+	    if (rc2 == 1 && event.key.timestamp == key_event.key.timestamp) {
+		error("SDL: duplicate keypress events\n");
+		/* at this point we can't trust text_event */
+		rc = 0;
+	    }
+	}
+	if (rc == 1)
+	    SDL_process_key_text(event.key, text_event.text);
+	else
+	    SDL_process_key_press(event.key);
+      }
       break;
     case SDL_KEYUP: {
       SDL_Keysym keysym = event.key.keysym;
@@ -852,14 +894,7 @@ static void SDL_handle_events(void)
         if (!m_cursor_visible)
 	    SDL_ShowCursor(SDL_DISABLE);
       }
-#ifdef X_SUPPORT
-#if _HAVE_XKB
-      if (x11_display && config.X_keycode)
-	SDL_process_key_xkb(x11_display, event.key);
-      else
-#endif
-#endif
-	SDL_process_key(event.key);
+	SDL_process_key_release(event.key);
       break;
     }
 
@@ -878,15 +913,18 @@ static void SDL_handle_events(void)
 				   y_to_row(event.button.y, m_y_res));
 	  else if (event.button.button == SDL_BUTTON_MIDDLE) {
 	    char *paste = SDL_GetClipboardText();
-	    if (paste)
+	    if (paste) {
+	      set_shiftstate(0);
 	      paste_text(paste, strlen(paste), "utf8");
+	    }
 	  }
 	  break;
 	}
 #endif				/* CONFIG_SDL_SELECTION */
-	mouse_move_buttons(buttons & SDL_BUTTON(1),
-			   buttons & SDL_BUTTON(2),
-			   buttons & SDL_BUTTON(3));
+	mouse_move_buttons(!!(buttons & SDL_BUTTON(1)),
+			   !!(buttons & SDL_BUTTON(2)),
+			   !!(buttons & SDL_BUTTON(3)),
+			   MOUSE_SDL);
 	break;
       }
     case SDL_MOUSEBUTTONUP:
@@ -902,9 +940,10 @@ static void SDL_handle_events(void)
 	    }
 	}
 #endif				/* CONFIG_SDL_SELECTION */
-	mouse_move_buttons(buttons & SDL_BUTTON(1),
-			   buttons & SDL_BUTTON(2),
-			   buttons & SDL_BUTTON(3));
+	mouse_move_buttons(!!(buttons & SDL_BUTTON(1)),
+			   !!(buttons & SDL_BUTTON(2)),
+			   !!(buttons & SDL_BUTTON(3)),
+			   MOUSE_SDL);
 	break;
       }
 
@@ -915,13 +954,13 @@ static void SDL_handle_events(void)
 #endif				/* CONFIG_SDL_SELECTION */
       if (grab_active)
 	mouse_move_relative(event.motion.xrel, event.motion.yrel,
-			    m_x_res, m_y_res);
+			    m_x_res, m_y_res, MOUSE_SDL);
       else
 	mouse_move_absolute(event.motion.x, event.motion.y, m_x_res,
-			    m_y_res);
+			    m_y_res, MOUSE_SDL);
       break;
     case SDL_MOUSEWHEEL:
-      mouse_move_wheel(-event.wheel.y);
+      mouse_move_wheel(-event.wheel.y, MOUSE_SDL);
       break;
     case SDL_QUIT:
       leavedos(0);
@@ -949,7 +988,7 @@ static int SDL_mouse_init(void)
     return FALSE;
 
   mice->type = MOUSE_SDL;
-  mouse_enable_native_cursor(config.X_fullscreen);
+  mouse_enable_native_cursor(config.X_fullscreen, MOUSE_SDL);
   /* we have the X cursor, but if we start fullscreen, grab by default */
   m_printf("MOUSE: SDL Mouse being set\n");
   return TRUE;

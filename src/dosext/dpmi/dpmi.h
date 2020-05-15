@@ -104,7 +104,6 @@ struct DPMIclient_struct {
   int is_32;
   dpmi_pm_block_root pm_block_root;
   unsigned short private_data_segment;
-  int in_dpmi_rm_stack;
   dpmi_pm_block *pm_stack;
   int in_dpmi_pm_stack;
   /* for real mode call back, DPMI function 0x303 0x304 */
@@ -135,6 +134,18 @@ struct RSP_s {
   dpmi_pm_block_root pm_block_root;
 };
 
+struct SHM_desc {
+  uint32_t req_len;
+  uint32_t ret_len;
+  uint32_t handle;
+  uint32_t addr;
+  uint32_t name_offset32;
+  uint16_t name_selector;
+  uint16_t padding;
+#define SHM_NOEXEC 1
+  uint32_t flags;
+};
+
 enum { DPMI_RET_FAULT=-3, DPMI_RET_EXIT=-2, DPMI_RET_DOSEMU=-1,
        DPMI_RET_CLIENT=0, DPMI_RET_TRAP_DB=1, DPMI_RET_TRAP_BP=3,
        DPMI_RET_INT=0x100 };
@@ -160,20 +171,18 @@ extern void dpmi_iret_unwind(sigcontext_t *scp);
 #else
 #define dpmi_iret_setup(x)
 #endif
-#ifdef __linux__
 int dpmi_fault(sigcontext_t *scp);
-#endif
 void dpmi_realmode_hlt(unsigned int lina);
 void run_pm_int(int inum);
 void fake_pm_int(void);
 int in_dpmi_pm(void);
 int dpmi_active(void);
+int dpmi_segment_is32(int sel);
 
-#ifdef __linux__
+#ifdef USE_MHPDBG   /* dosdebug support */
 int dpmi_mhp_regs(void);
 void dpmi_mhp_getcseip(unsigned int *seg, unsigned int *off);
 void dpmi_mhp_getssesp(unsigned int *seg, unsigned int *off);
-int dpmi_segment_is32(int sel);
 int dpmi_mhp_getcsdefault(void);
 int dpmi_mhp_setTF(int on);
 void dpmi_mhp_GetDescriptor(unsigned short selector, unsigned int *lp);
@@ -201,9 +210,12 @@ unsigned int GetSegmentLimit(unsigned short sel);
 int CheckSelectors(sigcontext_t *scp, int in_dosemu);
 int ValidAndUsedSelector(unsigned short selector);
 int dpmi_is_valid_range(dosaddr_t addr, int len);
+int dpmi_read_access(dosaddr_t addr);
+int dpmi_write_access(dosaddr_t addr);
 
 extern char *DPMI_show_state(sigcontext_t *scp);
 extern void dpmi_sigio(sigcontext_t *scp);
+extern void run_dpmi(void);
 
 extern int ConvertSegmentToDescriptor(unsigned short segment);
 extern int SetSegmentBaseAddress(unsigned short selector,
@@ -226,6 +238,9 @@ extern far_t DPMI_allocate_realmode_callback(u_short sel, int offs, u_short rm_s
 	int rm_offs);
 extern int DPMI_free_realmode_callback(u_short seg, u_short off);
 extern int DPMI_get_save_restore_address(far_t *raddr, struct pmaddr_s *paddr);
+
+extern int DPMIAllocateShared(struct SHM_desc *shm);
+extern int DPMIFreeShared(uint32_t handle);
 
 extern void dpmi_setup(void);
 extern void dpmi_reset(void);
@@ -255,6 +270,16 @@ static inline void dpmi_realmode_hlt(unsigned int lina)
 }
 
 static inline int dpmi_is_valid_range(dosaddr_t addr, int len)
+{
+    return 0;
+}
+
+static inline int dpmi_read_access(dosaddr_t addr)
+{
+    return 0;
+}
+
+static inline int dpmi_write_access(dosaddr_t addr)
 {
     return 0;
 }

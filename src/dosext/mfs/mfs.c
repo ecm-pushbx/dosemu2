@@ -184,6 +184,7 @@ TODO:
 #include "doshelpers.h"
 /* For passing through GetRedirection Status */
 #include "memory.h"
+#include "lowmem.h"
 #include "redirect.h"
 #include "mangle.h"
 #include "utilities.h"
@@ -237,10 +238,11 @@ static int stk_offs;
 #define	SEEK_FROM_EOF		0x21
 #define	PROCESS_TERMINATED	0x22
 #define	QUALIFY_FILENAME	0x23
-/*#define TURN_OFF_PRINTER	0x24 */
-#define MULTIPURPOSE_OPEN	0x2e	/* Used in DOS 4.0+ */
+#define TURN_OFF_PRINTER	0x24
 #define PRINTER_MODE  		0x25	/* Used in DOS 3.1+ */
 #define EXTENDED_ATTRIBUTES	0x2d	/* Used in DOS 4.x */
+#define MULTIPURPOSE_OPEN	0x2e	/* Used in DOS 4.0+ */
+#define GET_LARGE_FILE_INFO	0xa6	/* extension */
 
 #define EOS		'\0'
 #define	SLASH		'/'
@@ -275,7 +277,8 @@ static int dos_would_allow(char *fpath, const char *op, int equal);
 
 static int drives_initialized = FALSE;
 
-static struct file_fd open_files[256];
+#define MAX_OPENED_FILES 256
+static struct file_fd open_files[MAX_OPENED_FILES];
 static int num_drives = 0;
 static int process_mask = 0;
 
@@ -286,12 +289,12 @@ static uint16_t lol_offset, sda_offset;
 int lol_dpbfarptr_off, lol_cdsfarptr_off, lol_last_drive_off, lol_nuldev_off,
     lol_njoined_off;
 
-int cds_current_path_off, cds_flags_off, cds_DBP_pointer_off,
+int cds_current_path_off, cds_flags_off, cds_DPB_pointer_off,
     cds_cur_cluster_off, cds_rootlen_off, cds_record_size;
 
 #define cds_current_path(cds)     ((char *)&cds[cds_current_path_off])
 #define cds_flags(cds)        (*(u_short *)&cds[cds_flags_off])
-#define cds_DBP_pointer(cds)    (*(far_t *)&cds[cds_DBP_pointer_off])
+#define cds_DPB_pointer(cds)    (*(far_t *)&cds[cds_DPB_pointer_off])
 #define cds_cur_cluster(cds)  (*(u_short *)&cds[cds_cur_cluster_off])
 #define cds_rootlen(cds)      (*(u_short *)&cds[cds_rootlen_off])
 
@@ -318,6 +321,22 @@ int sdb_drive_letter_off, sdb_template_name_off, sdb_template_ext_off,
     sdb_file_ext_off, sdb_file_attr_off, sdb_file_time_off, sdb_file_date_off,
     sdb_file_st_cluster_off, sdb_file_size_off;
 
+#ifdef F_OFD_SETLK // Only Linux >= 3.15, but proposed for POSIX
+static int lock_fcntl(int fd, int cmd, struct flock *fl)
+{
+  if (cmd == F_SETLK)
+    return fcntl(fd, F_OFD_SETLK, fl);
+
+  if (cmd == F_GETLK)
+    return fcntl(fd, F_OFD_GETLK, fl);
+
+  Debug0((dbg_fd, "lock_fcntl() with cmd != F_SETLK or F_GETLK\n"));
+  leavedos(99);
+  return -1;
+}
+#else // no OFD support
+#define lock_fcntl fcntl
+#endif
 
 static char *cds_flags_to_str(uint16_t flags) {
   static char s[5 * 8 + 1]; // 5 names * maxstrlen + terminator;
@@ -340,6 +359,66 @@ static char *cds_flags_to_str(uint16_t flags) {
     s[len - 1] = '\0'; // trim the trailing comma
 
   return s;
+}
+
+static const char *redirector_op_to_str(uint8_t op) {
+  const char *s[] = {
+    "Installation check",
+    "Remove directory",
+    "Remove directory (2)",
+    "Make directory",
+    "Make directory (2)",
+    "Set current directory",
+    "Close file",
+    "Commit file",
+    "Read file",
+    "Write file",
+    "Lock file region",
+    "Unlock file region",
+    "Get disk space",
+    "Set file attributes (IFS)",
+    "Set file attributes",
+    "Get file attributes",
+    "Get file attributes (IFS)",
+    "Rename file",
+    "Rename file (IFS)",
+    "Delete file",
+    "Delete file (IFS)",
+    "Open file (IFS)",
+    "Open existing file",
+    "Create truncate file",
+    "Create truncate file (no CDS)",
+    "Find file (no CDS)",
+    "Find next (no CDS, IFS)",
+    "Find file",
+    "Find next",
+    "Close all",
+    "Control redirect",
+    "Printer setup",
+    "Flush all disk buffers",
+    "Seek from EOF",
+    "Process terminated",
+    "Qualify filename",
+    "Turn off printer",
+    "Printer mode",
+    "Printer echo on/off",
+    "Unused",
+    "Unused (IFS)",
+    "Unused (IFS)",
+    "Close all files for process (IFS)",
+    "Generic IOCTL (IFS)",
+    "Update CB???",
+    "Extended attributes (IFS)",
+    "Multipurpose open",
+  };
+  static_assert(sizeof(s) == sizeof(s[0]) * (MULTIPURPOSE_OPEN + 1),
+                "Size of redirector operation name array suspicious");
+
+  if (op == GET_LARGE_FILE_INFO)
+    return "Get large file info (extension)";
+  else if (op > MULTIPURPOSE_OPEN)
+    return "Operation out of range";
+  return s[op];
 }
 
 /* here are the functions used to interface dosemu with the mach
@@ -370,6 +449,59 @@ static uint16_t GetDataSegment(void)
   ds = _DS;
   REGS = saved_regs;
   return ds;
+}
+
+/*****************************
+ * GetCurrentDriveInDOS
+ * on entry:
+ *   drv: For the result (0=A, 1=B etc)
+ * on exit:
+ *   Returns 1 on success, 0 on fail
+ * notes:
+ *   This function can be used only whilst InDOS, in essence that means from
+ *   redirector int2f/11 function. It relies on being able to run int2f/12
+ *   functions which need to use the DOS stack. Outside of DOS use int21/19
+ *   which is much easier in any case
+ *****************************/
+static int GetCurrentDriveInDOS(uint8_t *drv)
+{
+  struct vm86_regs saved_regs = REGS;
+  char *buf, *dst;
+  uint8_t dd;
+  int ret = 0;
+
+  if (!(buf = lowmem_heap_alloc(2 + 128)))
+    return 0;
+
+  /* Ask DOS to canonicalize '\' which should give us 'X:\' back */
+  memcpy(buf, "\\", 2);
+  _DS = DOSEMU_LMHEAP_SEG;	// DS:SI -> file name to be fully qualified
+  _SI = DOSEMU_LMHEAP_OFFS_OF(buf);
+  dst = buf + 2;
+  memset(dst, 0, 128);
+  _ES = _DS;			// ES:DI -> canonical file name result
+  _DI = _SI + 2;
+
+  _AX = 0x1221;
+  do_int_call_back(0x2f);
+
+  REGS = saved_regs;
+
+  Debug0((dbg_fd, "GetCurrentDriveInDOS() '\\' -> '%s'\n", dst));
+
+  // Sanity checks
+  if (!dst[0] || dst[1] != ':')
+    goto done;
+  dd = toupper(dst[0]) - 'A';
+  if (dd >= 26)
+    goto done;
+
+  *drv = dd;
+  ret = 1;
+
+done:
+  lowmem_heap_free(buf);
+  return ret;
 }
 
 /*****************************
@@ -456,7 +588,7 @@ select_drive(struct vm86_regs *state, int *drive)
   int dd;
   int fn = LOW(state->eax);
 
-  Debug0((dbg_fd, "selecting drive fn=%x\n", fn));
+  Debug0((dbg_fd, "selecting drive\n"));
 
   switch (fn) {
   case INSTALLATION_CHECK:	/* 0x0 */
@@ -473,10 +605,8 @@ select_drive(struct vm86_regs *state, int *drive)
     {
       char *name = (char *)Addr(state, ds, esi);
 
-      Debug0((dbg_fd, "FNX=%.15s\n", name));
-      if (strncasecmp(name, LINUX_RESOURCE, strlen(LINUX_RESOURCE)) == 0) {
-        dd = DRIVE_Z;
-      } else if (name[1] == ':') {
+      Debug0((dbg_fd, "select_drive() DS:SI = '%s'\n", name));
+      if (name[1] == ':') {
         dd = toupperDOS(name[0]) - 'A';
       } else if (strlen(name) == 4 && isdigit(name[3])) {
         dd = PRINTER_BASE_DRIVE + toupperDOS(name[3]) - '0' - 1;
@@ -509,12 +639,10 @@ select_drive(struct vm86_regs *state, int *drive)
     {
       char *fn1 = sda_filename1(sda);
 
-      Debug0((dbg_fd, "sda filename1 = '%.15s'\n", fn1));
+      Debug0((dbg_fd, "select_drive() sda_filename1 = '%s'\n", fn1));
 
       if (fn1[0] && fn1[1] == ':')
         dd = toupperDOS(fn1[0]) - 'A';
-      else if (strncasecmp(fn1, LINUX_RESOURCE, strlen(LINUX_RESOURCE)) == 0)
-        dd = (fn == SET_CURRENT_DIRECTORY) ? -1 : DRIVE_Z;
       else if (strncasecmp(fn1, LINUX_PRN_RESOURCE, strlen(LINUX_PRN_RESOURCE)) == 0)
         dd = PRINTER_BASE_DRIVE + toupperDOS(fn1[sizeof(LINUX_PRN_RESOURCE)]) - '0' - 1;
       else
@@ -530,19 +658,11 @@ select_drive(struct vm86_regs *state, int *drive)
   case LOCK_FILE_REGION:	/* 0xa */
   case UNLOCK_FILE_REGION:	/* 0xb */
   case SEEK_FROM_EOF:		/* 0x21 */
+  case GET_LARGE_FILE_INFO:	/* 0xa6 */
     {
       sft_t sft = (u_char *) Addr(state, es, edi);
 
-      dd = sft_device_info(sft) & 0x0d1f;
-        /* 11/20/95 by RGPP:
-          Some Novell applications seem to trash the sft_device_info
-          in such a way that it looks like an existing DOSEMU re-
-          directed drive.  This condition seems to be detectable as
-          a non-zero value in the second four bits of the entry.
-	  2002/01/08: apparently PTSDOS doesn't like bit 9 though...
-	*/
-      if (dd == 0 && (sft_device_info(sft) & 0x8000))
-        dd = DRIVE_Z;
+      dd = SFT_DRIVE(sft);
     }
     break;
 
@@ -813,11 +933,10 @@ init_all_drives(void)
     for (dd = 0; dd < MAX_DRIVE; dd++) {
       drives[dd].root = NULL;
       drives[dd].root_len = 0;
-      drives[dd].read_only = FALSE;
+      drives[dd].options = 0;
+      drives[dd].user_param = 0;
       drives[dd].curpath[0] = '\0';
     }
-    /* special processing for UNC "drive" */
-    drives[DRIVE_Z].root = strdup("");
 
     process_mask = umask(0);
     umask(process_mask);
@@ -915,7 +1034,7 @@ get_unix_path(char *new_path, const char *path)
 }
 
 static int
-init_drive(int dd, char *path, int options)
+init_drive(int dd, char *path, uint16_t user, uint16_t options)
 {
   struct stat st;
   char *new_path;
@@ -926,7 +1045,8 @@ init_drive(int dd, char *path, int options)
       return 0;
     drives[dd].root = strdup(path);
     drives[dd].root_len = strlen(path);
-    drives[dd].read_only = options;
+    drives[dd].user_param = user;
+    drives[dd].options = (user == REDIR_CLIENT_SIGNATURE) ? options : 0;
     drives[dd].curpath[0] = '\0';
     return 1;
   }
@@ -972,16 +1092,16 @@ init_drive(int dd, char *path, int options)
   drives[dd].root_len = new_len;
   if (num_drives <= dd)
     num_drives = dd + 1;
-  drives[dd].read_only = options;
+  drives[dd].options = (user == REDIR_CLIENT_SIGNATURE) ? options : 0;
   drives[dd].curpath[0] = 'A' + dd;
   drives[dd].curpath[1] = ':';
   drives[dd].curpath[2] = '\\';
   drives[dd].curpath[3] = '\0';
 
   Debug0((dbg_fd, "initialised drive %d as %s with access of %s\n", dd, drives[dd].root,
-	  drives[dd].read_only ? "READ_ONLY" : "READ_WRITE"));
-  if (options >= 2 && options <= 5)
-    register_cdrom(dd, options - 1);
+	  read_only(drives[dd]) ? "READ_ONLY" : "READ_WRITE"));
+  if (cdrom(drives[dd]) && cdrom(drives[dd]) <= 4)
+    register_cdrom(dd, options >> 1);
 
   return 1;
 }
@@ -1171,8 +1291,12 @@ static void fill_entry(struct dir_ent *entry, const char *name, int drive)
     entry->size = 0;
     entry->time = 0;
     entry->attr = get_dos_attr(NULL,entry->mode,entry->hidden);
-  }
-  else {
+  } else if (is_dos_device(buf)) {
+    entry->mode = S_IFREG;
+    entry->size = 0;
+    entry->time = time(NULL);
+    entry->attr = get_dos_attr(NULL,entry->mode,entry->hidden);
+  } else {
     entry->mode = sbuf.st_mode;
     entry->size = sbuf.st_size;
     entry->time = sbuf.st_mtime;
@@ -1216,19 +1340,16 @@ static int convert_compare(const char *d_name, char *fname, char *fext,
    mext = DOS (uppercase) extension to match (can have wildcards)
    drive = drive on which the directory lives
 */
-static struct dir_list *get_dir(char *name, char *mname, char *mext, int drive)
+static struct dir_list *get_dir_ff(char *name, char *mname, char *mext,
+	int drive)
 {
   struct mfs_dir *cur_dir;
   struct mfs_dirent *cur_ent;
   struct dir_list *dir_list;
   struct dir_ent *entry;
-  struct stat sbuf;
   char buf[256];
   char fname[8];
   char fext[3];
-
-  if(is_dos_device(name) || !find_file(name, &sbuf, drive, NULL))
-    return NULL;
 
   if ((cur_dir = dos_opendir(name)) == NULL) {
     Debug0((dbg_fd, "get_dir(): couldn't open '%s' errno = %s\n", name, strerror(errno)));
@@ -1246,7 +1367,7 @@ static struct dir_list *get_dir(char *name, char *mname, char *mext, int drive)
  *
  * DANG_END_REMARK
  */
-  if (mname && is_dos_device(mname)) {
+  if (is_dos_device(mname)) {
     dir_list = make_dir_list(1);
     entry = make_entry(dir_list);
 
@@ -1262,8 +1383,10 @@ static struct dir_list *get_dir(char *name, char *mname, char *mext, int drive)
     return (dir_list);
   }
   /* for efficiency we don't read everything if there are no wildcards */
-  else if (mname && !memchr(mname, '?', 8) && !memchr(mext, '?', 3))
+  else if (!memchr(mname, '?', 8) && !memchr(mext, '?', 3))
   {
+    struct stat sbuf;
+
     dos83_to_ufs(buf, mname, mext);
     if (exists(name, buf, &sbuf, drive))
     {
@@ -1285,45 +1408,41 @@ static struct dir_list *get_dir(char *name, char *mname, char *mext, int drive)
   else {
     int is_root = (strlen(name) == drives[drive].root_len);
     while ((cur_ent = dos_readdir(cur_dir))) {
-      if (mname) {
-	sigset_t mask;
-
-	/* this while loop can take a _long_ time ... better avoid signal queue
-	 *overflows AV
-	 */
-	sigpending(&mask);
-	if (sigismember(&mask, SIGALRM)) {
-	  sigalarm_block(0);
-	  /* the pending sigalrm must be delivered now */
-	  sigalarm_block(1);
-	}
-	coopth_yield();
-
-	Debug0((dbg_fd, "get_dir(): `%s' \n", cur_ent->d_name));
-
-	/* this is the expensive part, done much later in findnext
-	   if mname == NULL */
-	if (!convert_compare(cur_ent->d_name, fname, fext,
-			      mname, mext, is_root))
-	  continue;
-      }
-
-      if (dir_list == NULL) {
+      Debug0((dbg_fd, "get_dir(): `%s' \n", cur_ent->d_name));
+      if (!convert_compare(cur_ent->d_name, fname, fext, mname, mext, is_root))
+	continue;
+      if (dir_list == NULL)
 	dir_list = make_dir_list(20);
-      }
       entry = make_entry(dir_list);
-
       strcpy(entry->d_name, cur_ent->d_name);
-      /* only fill these values if we don't search everything */
-      if (mname) {
-	memcpy(entry->name, fname, 8);
-	memcpy(entry->ext, fext, 3);
-	fill_entry(entry, name, drive);
-      }
+      memcpy(entry->name, fname, 8);
+      memcpy(entry->ext, fext, 3);
     }
   }
   dos_closedir(cur_dir);
   return (dir_list);
+}
+
+static struct dir_list *get_dir(char *name, char *mname, char *mext, int drive)
+{
+  int i;
+  struct dir_list *list;
+  struct stat st;
+
+  /* find_file() validates (and changes) source path */
+  if (!find_file(name, &st, drive, NULL)) {
+    Debug0((dbg_fd, "get_dir(): find_file() returned false for '%s'\n", name));
+    return NULL;
+  }
+  list = get_dir_ff(name, mname, mext, drive);
+  if (!list)
+    return NULL;
+  for (i = 0; i < list->nr_entries; i++) {
+    if (signal_pending())
+	coopth_yield();
+    fill_entry(&list->de[i], name, drive);
+  }
+  return list;
 }
 
 /*
@@ -1377,7 +1496,7 @@ static int init_dos_offsets(int ver)
 
   cds_current_path_off = 0x0;
   cds_flags_off = 0x43;
-  cds_DBP_pointer_off = 0x45;
+  cds_DPB_pointer_off = 0x45;
   cds_cur_cluster_off = 0x49;
   cds_rootlen_off = 0x4f;
 
@@ -1686,7 +1805,7 @@ dos_fs_dev(struct vm86_regs *state)
 
     lol = SEGOFF2LINEAR(state->ds, lol_offset);
     sda = MK_FP32(state->ds, sda_offset);
-    redver = state->ecx;
+    redver = WORD(state->ecx);
     Debug0((dbg_fd, "lol=%#x\n", lol));
     Debug0((dbg_fd, "sda=%p\n", sda));
     Debug0((dbg_fd, "redver=%02d\n", redver));
@@ -1941,16 +2060,17 @@ int find_file(char *fpath, struct stat * st, int drive, int *doserrno)
   Debug0((dbg_fd, "find file %s\n", fpath));
 
   if (is_dos_device(fpath)) {
-    struct stat st;
+    struct stat _st;
     char *s = strrchr(fpath, '/');
     int path_exists = 0;
 
     /* check if path exists */
     if (s != NULL) {
       *s = '\0';
-      path_exists = (!stat(fpath, &st) && S_ISDIR(st.st_mode));
+      path_exists = (!stat(fpath, &_st) && S_ISDIR(_st.st_mode));
       *s = '/';
     }
+    memset(st, 0, sizeof(*st));
     Debug0((dbg_fd, "device exists  = %d\n", s == NULL || path_exists));
     return (s == NULL || path_exists);
   }
@@ -2091,7 +2211,6 @@ struct stack_entry
   struct dir_list *hlist;
   unsigned psp;
   int seq;
-  int duplicates;
   char *fpath;
 };
 
@@ -2113,11 +2232,6 @@ static void free_list(struct stack_entry *se, int force)
 {
   struct dir_list *list;
 
-  if (se->duplicates && !force) {
-    se->duplicates--;
-    return;
-  }
-
   free(se->fpath);
   se->fpath = NULL;
 
@@ -2137,24 +2251,6 @@ static inline int hlist_push(struct dir_list *hlist, unsigned psp, const char *f
 
   Debug0((dbg_fd, "hlist_push: %d hlist=%p PSP=%d path=%s\n", hlists.tos, hlist, psp, fpath));
 
-  if (fpath[0]) for (se = hlists.stack; se < &hlists.stack[hlists.tos]; se++) {
-    if (se->hlist && se->fpath && strcmp(se->fpath, fpath) == 0) {
-      Debug0((dbg_fd, "hlist_push: found duplicate\n"));
-      /* if the list is owned by the current PSp then we must not
-         destroy it after the last findnext. If the list is owned
-         by a different PSP then it is never destroyed by the current
-         PSP so we should not mark it duplicate.
-         We then replace the duplicate with a fresh directory list;
-         this does not conflict with how DOS works on real FAT drives,
-         where a "findnext" looks directly in the directory.
-      */
-      if (se->psp == psp)
-        se->duplicates++;
-      free_list(se, TRUE);
-      goto exit;
-    }
-  }
-
   if (psp != prev_psp) {
     Debug0((dbg_fd, "hlist_push_new_psp: prev_psp=%d psp=%d\n", prev_psp, psp));
     prev_psp = psp;
@@ -2168,7 +2264,6 @@ static inline int hlist_push(struct dir_list *hlist, unsigned psp, const char *f
     for (se = hlists.stack; se < &hlists.stack[hlists.tos]; se++) {
       if (se->hlist == NULL) {
         Debug0((dbg_fd, "hlist_push gap=%td\n", se - hlists.stack));
-        se->duplicates = 0;
         se->psp = psp;
         goto exit;
       }
@@ -2182,12 +2277,11 @@ static inline int hlist_push(struct dir_list *hlist, unsigned psp, const char *f
   }
 
   se = &hlists.stack[hlists.tos++];
-  se->duplicates = 0;
   se->psp = psp;
  exit:
   se->hlist = hlist;
   se->fpath = strdup(fpath);
-  return se - hlists.stack;;
+  return se - hlists.stack;
 }
 
 /*
@@ -2223,11 +2317,6 @@ static inline void hlist_pop(int indx, unsigned psp)
     return;
   if (se->psp != psp) {
     Debug0((dbg_fd, "hlist_pop: psp mismatch\n"));
-    return;
-  }
-  if (se->duplicates) {
-    Debug0((dbg_fd, "hlist_pop: don't pop duplicates\n"));
-    se->duplicates--;
     return;
   }
   if (se->hlist != NULL) {
@@ -2394,19 +2483,19 @@ path_to_dos(char *path)
     *s = '\\';
 }
 
-static int
-GetRedirection(struct vm86_regs *state, u_short index)
+static int GetRedirection(struct vm86_regs *state)
 {
+  u_short index = WORD(state->ebx);
   int dd;
   u_short returnBX;		/* see notes below */
   u_short returnCX;
+  u_short returnDX;
   char *resourceName;
   char *deviceName;
   u_short *userStack;
   cds_t tcds;
 
-  /* Set number of redirected drives to 0 prior to getting new
-	   Count */
+  /* Set number of redirected drives to 0 prior to getting new count */
   /* BH has device status 0=valid */
   /* BL has the device type - 3 for printer, 4 for disk */
   /* CX is supposed to be used to return the stored redirection parameter */
@@ -2415,62 +2504,64 @@ GetRedirection(struct vm86_regs *state, u_short index)
   for (dd = 0; dd < num_drives; dd++) {
     if (drives[dd].root) {
       if (index == 0) {
-	/* return information for this drive */
-	Debug0((dbg_fd, "redirection root =%s\n", drives[dd].root));
-	deviceName = Addr(state, ds, esi);
-	deviceName[0] = 'A' + dd;
-	deviceName[1] = ':';
-	deviceName[2] = EOS;
-	resourceName = Addr(state, es, edi);
-	strcpy(resourceName, LINUX_RESOURCE);
-	strcat(resourceName, drives[dd].root);
-	path_to_dos(resourceName);
-	Debug0((dbg_fd, "resource name =%s\n", resourceName));
-	Debug0((dbg_fd, "device name =%s\n", deviceName));
-	userStack = (u_short *) sda_user_stack(sda);
+        /* return information for this drive */
+        Debug0((dbg_fd, "redirection root =%s\n", drives[dd].root));
 
-	/* have to return BX, and CX on the user return stack */
-	/* return a "valid" disk redirection */
-	returnBX = 4;		/*BH=0, BL=4 */
+        deviceName = Addr(state, ds, esi);
+        snprintf(deviceName, 16, "%c:", 'A' + dd);
+        Debug0((dbg_fd, "device name =%s\n", deviceName));
 
-	/* set the high bit of the return CL so that */
-	/* NetWare shell doesn't get confused */
-        returnCX = 0x80;
+        resourceName = Addr(state, es, edi);
+        snprintf(resourceName, 128, LINUX_RESOURCE "%s", drives[dd].root);
+        path_to_dos(resourceName);
+        Debug0((dbg_fd, "resource name =%s\n", resourceName));
 
-        if (drives[dd].read_only)
-          returnCX |= 1;
+        /* have to return BX, and CX on the user return stack */
+        /* return a "valid" disk redirection */
+        returnBX = 4; /*BH=0, BL=4 */
 
+        /* set the high bit of the return CL so that */
+        /* NetWare shell doesn't get confused */
+        returnCX = drives[dd].user_param | 0x80;
+        Debug0((dbg_fd, "GetRedirection CX=%04x\n", returnCX));
+
+        /* This is a Dosemu specific field, but RBIL states it is usually
+           destroyed by a redirector, so we may use it to pass our info */
+        returnDX = drives[dd].options;
         /* see if DOS believes drive is redirected */
         if (!GetCDSInDOS(dd, &tcds)) {
-          Debug0((dbg_fd, "GetRedirection can't get CDS\n"));
+          Debug0((dbg_fd, "GetRedirection: can't get CDS\n"));
         } else {
           if ((cds_flags(tcds) & (CDS_FLAG_READY | CDS_FLAG_REMOTE)) != (CDS_FLAG_READY | CDS_FLAG_REMOTE))
-            returnCX |= 2;
-          Debug0((dbg_fd, "GetRedirection CDS flags are 0x%04x (%s)\n",
+            returnDX |= REDIR_DEVICE_DISABLED;
+          Debug0((dbg_fd, "GetRedirection: CDS flags are 0x%04x (%s)\n",
                  cds_flags(tcds), cds_flags_to_str(cds_flags(tcds))));
         }
+        Debug0((dbg_fd, "GetRedirection DX=%04x\n", returnDX));
 
-        Debug0((dbg_fd, "GetRedirection CX=%04x\n", returnCX));
-	userStack[1] = returnBX;
-	userStack[2] = returnCX;
-	/* XXXTRB - should set session number in returnBP if */
-	/* we are doing an extended getredirection */
-	return (TRUE);
+        userStack = (u_short *)sda_user_stack(sda);
+        userStack[1] = returnBX;
+        userStack[2] = returnCX;
+        userStack[3] = returnDX;
+        /* XXXTRB - should set session number in returnBP if */
+        /* we are doing an extended getredirection */
+        return TRUE;
       } else {
-	/* count down until the index is exhausted */
-	index--;
+        /* count down until the index is exhausted */
+        index--;
       }
     }
   }
-  if (IS_REDIRECTED(0x2f)) {
-    redirected_drives = WORD(state->ebx) - index;
-    SETWORD(&(state->ebx), index);
-    Debug0((dbg_fd, "GetRedirect passing index of %d, Total redirected=%d\n", index, redirected_drives));
-    return (REDIRECT);
-  }
-
+#if 0
+  /* if we dont own this index, pass down */
+  redirected_drives = WORD(state->ebx) - index;
+  SETWORD(&(state->ebx), index);
+  Debug0((dbg_fd, "GetRedirect passing index of %d, Total redirected=%d\n", index, redirected_drives));
+  return REDIRECT;
+#else
   SETWORD(&(state->eax), NO_MORE_FILES);
-  return (FALSE);
+  return FALSE;
+#endif
 }
 
 /*****************************
@@ -2489,7 +2580,7 @@ GetRedirectionRoot(int dsk, char **resourceName,int *ro_flag)
   *resourceName = malloc(PATH_MAX + 1);
   if (*resourceName == NULL) return 1;
   strcpy(*resourceName, drives[dsk].root );
-  *ro_flag=drives[dsk].read_only;
+  *ro_flag=read_only(drives[dsk]);
   return 0;
 
 }
@@ -2507,6 +2598,8 @@ static int RedirectDisk(struct vm86_regs *state, int drive, char *resourceName)
 {
   char path[256];
   cds_t cds;
+  uint16_t user = LO_WORD(state->ecx);
+  uint16_t ro_attrs = LO_WORD(state->edx) & 0b1111;
 
   if (!GetCDSInDOS(drive, &cds)) {
     SETWORD(&(state->eax), DISK_DRIVE_INVALID);
@@ -2522,13 +2615,14 @@ static int RedirectDisk(struct vm86_regs *state, int drive, char *resourceName)
   path[0] = 0;
   path_to_ufs(path, 0, &resourceName[strlen(LINUX_RESOURCE)], 1, 0);
 
-  /* if low bit of CX is set, then set for read only access */
-  Debug0((dbg_fd, "read-only/cdrom attribute = %d\n", (int)(state->ecx & 7)));
-  if (init_drive(drive, path, state->ecx & 7) == 0) {
+  /* low bit of DX is set for read only access or it's a CDROM */
+  Debug0((dbg_fd, "read-only attribute or cdrom unit = %u\n", ro_attrs));
+  if (init_drive(drive, path, user, ro_attrs) == 0) {
     SETWORD(&(state->eax), NETWORK_NAME_NOT_FOUND);
     return FALSE;
   }
 
+  drives[drive].saved_cds_flags = cds_flags(cds);
   cds_flags(cds) = CDS_FLAG_READY | CDS_FLAG_REMOTE | CDS_FLAG_NOTNET;
   cds_current_path(cds)[0] = 'A' + drive;
   cds_current_path(cds)[1] = ':';
@@ -2544,20 +2638,29 @@ static int RedirectDisk(struct vm86_regs *state, int drive, char *resourceName)
   return TRUE;
 }
 
-static int RedirectPrinter(char *resourceName)
+static int RedirectPrinter(struct vm86_regs *state, char *resourceName)
 {
-    int drive;
-    char *p;
-    if (strncmp(resourceName, LINUX_PRN_RESOURCE,
-             strlen(LINUX_PRN_RESOURCE)) != 0)
-      return FALSE;
-    p = resourceName + strlen(LINUX_PRN_RESOURCE);
-    if (p[0] != '\\' || !isdigit(p[1]))
-      return FALSE;
-    drive = PRINTER_BASE_DRIVE + toupperDOS(p[1]) - '0' - 1;
-    if (init_drive(drive, p + 1, 0) == 0)
-      return (FALSE);
-    return TRUE;
+  uint16_t user = LO_WORD(state->ecx);
+  int drive;
+  char *p;
+
+  if (user == REDIR_CLIENT_SIGNATURE && state->edx & 0b1111) {
+    Debug0((dbg_fd, "Readonly/cdrom printer redirection\n"));
+    return FALSE;
+  }
+
+  if (strncmp(resourceName, LINUX_PRN_RESOURCE, strlen(LINUX_PRN_RESOURCE)) != 0)
+    return FALSE;
+
+  p = resourceName + strlen(LINUX_PRN_RESOURCE);
+  if (p[0] != '\\' || !isdigit(p[1]))
+    return FALSE;
+
+  drive = PRINTER_BASE_DRIVE + toupperDOS(p[1]) - '0' - 1;
+  if (init_drive(drive, p + 1, user, 0) == 0)
+    return FALSE;
+
+  return TRUE;
 }
 
 /*****************************
@@ -2579,11 +2682,7 @@ static int DoRedirectDevice(struct vm86_regs *state)
 
   Debug0((dbg_fd, "RedirectDevice %s to %s\n", deviceName, resourceName));
   if (LOW(state->ebx) == REDIR_PRINTER_TYPE) {
-    if (state->ecx & 7) {
-      Debug0((dbg_fd, "Readonly printer redirection\n"));
-      return FALSE;
-    }
-    return RedirectPrinter(resourceName);
+    return RedirectPrinter(state, resourceName);
   }
 
   if (strncmp(resourceName, LINUX_RESOURCE, strlen(LINUX_RESOURCE)) != 0) {
@@ -2611,19 +2710,27 @@ int ResetRedirection(int dsk)
   free(drives[dsk].root);
   drives[dsk].root = NULL;
   drives[dsk].root_len = 0;
-  drives[dsk].read_only = FALSE;
+  drives[dsk].options = 0;
+  drives[dsk].user_param = 0;
   drives[dsk].curpath[0] = '\0';
   unregister_cdrom(dsk);
   return 0;
 }
 
+/* See if there is a physical drive behind any redirection */
+static int hasPhysical(cds_t cds)
+{
+  far_t DPBptr = cds_DPB_pointer(cds);
+
+  return (DPBptr.offset != 0 || DPBptr.segment != 0);
+}
+
 static void RemoveRedirection(int drive, cds_t cds)
 {
   char *path;
-  far_t DBPptr;
 
   /* reset information in the CDS for this drive */
-  cds_flags(cds) = 0;		/* default to a "not ready" drive */
+  cds_flags(cds) = drives[drive].saved_cds_flags;
 
   path = cds_current_path(cds);
   /* set the current path for the drive */
@@ -2633,13 +2740,6 @@ static void RemoveRedirection(int drive, cds_t cds)
   path[3] = EOS;
   cds_rootlen(cds) = CDS_DEFAULT_ROOT_LEN;
   cds_cur_cluster(cds) = 0;	/* reset us at the root of the drive */
-
-  /* see if there is a physical drive behind this redirection */
-  DBPptr = cds_DBP_pointer(cds);
-  if (DBPptr.offset | DBPptr.segment) {
-    /* if DBP_pointer is non-NULL, set the drive status to ready */
-    cds_flags(cds) = CDS_FLAG_READY;
-  }
 }
 
 /*****************************
@@ -2653,7 +2753,7 @@ static int
 CancelRedirection(struct vm86_regs *state)
 {
   char *deviceName;
-  int drive;
+  uint8_t drive, curdrv;
   cds_t cds;
 
   /* first, see if this is one of our current redirections */
@@ -2662,7 +2762,7 @@ CancelRedirection(struct vm86_regs *state)
   Debug0((dbg_fd, "CancelRedirection on %s\n", deviceName));
 
   /* we only handle drive redirections, pass it through */
-  if (deviceName[1] != ':') {
+  if (!deviceName[0] || deviceName[1] != ':') {
     return REDIRECT;
   }
   drive = toupperDOS(deviceName[0]) - 'A';
@@ -2670,6 +2770,16 @@ CancelRedirection(struct vm86_regs *state)
   /* see if drive is in range of valid drives */
   if (!GetCDSInDOS(drive, &cds)) {
     SETWORD(&(state->eax), DISK_DRIVE_INVALID);
+    return FALSE;
+  }
+
+  // Don't remove drive from under us unless we revert to FATFS
+  if (!GetCurrentDriveInDOS(&curdrv)) {
+    SETWORD(&(state->eax), GENERAL_FAILURE);
+    return FALSE;
+  }
+  if (drive == curdrv && !hasPhysical(cds)) {
+    SETWORD(&(state->eax), ATT_REM_CUR_DIR);
     return FALSE;
   }
 
@@ -2687,6 +2797,7 @@ static int lock_file_region(int fd, int cmd, struct flock *fl, long long start, 
 {
   fl->l_whence = SEEK_SET;
   fl->l_pid = 0;
+
   /* first handle magic file lock value */
   if (start == 0x100000000LL && config.full_file_locks) {
     start = len = 0;
@@ -2705,7 +2816,7 @@ static int lock_file_region(int fd, int cmd, struct flock *fl, long long start, 
 
   fl->l_start = start;
   fl->l_len = len;
-  return fcntl(fd, cmd, fl);
+  return lock_fcntl(fd, cmd, fl);
 }
 
 static int
@@ -2847,19 +2958,19 @@ Values of DOS 2-6.22 file sharing behavior:
     Debug0((dbg_fd, "internal SHARE: unknown sharing mode %x\n",
 	    share_mode));
     return FALSE;
-    break;
   }
 
   ret = lock_file_region(fd, F_SETLK, &fl, 0x100000000LL, 1);
-  if (ret == -1)
+  if (ret == -1) {
     Debug0((dbg_fd, "internal SHARE: locking: failed to set lock\n"));
-  else
-    Debug0((dbg_fd,
-      "internal SHARE: locking: drive %c:, fd %d, type %d whence %d pid %d\n",
-      drive + 'A', fd, fl.l_type, fl.l_whence, fl.l_pid
-    ));
+    return FALSE;
+  }
 
-  return (TRUE);
+  Debug0((dbg_fd,
+      "internal SHARE: locking: drive %c:, fd %x, type %d whence %d pid %d\n",
+      drive + 'A', fd, fl.l_type, fl.l_whence, fl.l_pid));
+
+  return TRUE;
 }
 
 /* returns pointer to the basename of fpath */
@@ -2936,24 +3047,15 @@ static int dos_would_allow(char *fpath, const char *op, int equal)
 static int find_again(int firstfind, int drive, char *fpath,
 			    struct dir_list *hlist, struct vm86_regs *state, sdb_t sdb)
 {
-  int is_root;
   u_char attr;
   int hlist_index = sdb_p_cluster(sdb);
   struct dir_ent *de;
 
   attr = sdb_attribute(sdb);
 
-  is_root = (strlen(fpath) == drives[drive].root_len);
   while (sdb_dir_entry(sdb) < hlist->nr_entries) {
-
     de = &hlist->de[sdb_dir_entry(sdb)];
-
     sdb_dir_entry(sdb)++;
-
-    if (!convert_compare(de->d_name, de->name, de->ext,
-			 sdb_template_name(sdb), sdb_template_ext(sdb), is_root))
-      continue;
-
     Debug0((dbg_fd, "find_again entered with %.8s.%.3s\n", de->name, de->ext));
     fill_entry(de, fpath, drive);
     sdb_file_attr(sdb) = de->attr;
@@ -3051,21 +3153,13 @@ void get_volume_label(char *fname, char *fext, char *lfn, int drive)
   free(label);
 }
 
-/* return the Linux filename corresponding to the sft */
-char *sft_to_filename(unsigned char *sft, int *fd)
-{
-  int cnt = sft_fd(sft);
-  *fd = open_files[cnt].name ? open_files[cnt].fd : 0;
-  return open_files[cnt].name;
-}
-
 int dos_rmdir(const char *filename1, int drive, int lfn)
 {
   struct stat st;
   char fpath[PATH_MAX];
 
   Debug0((dbg_fd, "Remove Directory %s\n", filename1));
-  if (drives[drive].read_only)
+  if (read_only(drives[drive]))
     return ACCESS_DENIED;
   build_ufs_path_(fpath, filename1, drive, !lfn);
   if (find_file(fpath, &st, drive, NULL) && !is_dos_device(fpath)) {
@@ -3087,7 +3181,7 @@ int dos_mkdir(const char *filename1, int drive, int lfn)
   char fpath[PATH_MAX];
 
   Debug0((dbg_fd, "Make Directory %s\n", filename1));
-  if (drives[drive].read_only || (!lfn && is_long_path(filename1)))
+  if (read_only(drives[drive]) || (!lfn && is_long_path(filename1)))
     return ACCESS_DENIED;
   build_ufs_path_(fpath, filename1, drive, !lfn);
   if (find_file(fpath, &st, drive, NULL) || is_dos_device(fpath)) {
@@ -3119,7 +3213,7 @@ static int dos_rename(const char *filename1, const char *fname2, int drive)
 
   strcpy(filename2, fname2);
   Debug0((dbg_fd, "Rename file fn1=%s fn2=%s\n", filename1, filename2));
-  if (drives[drive].read_only)
+  if (read_only(drives[drive]))
     return ACCESS_DENIED;
   cp = strrchr(filename1, '/');
   if (!cp)
@@ -3179,7 +3273,7 @@ int dos_rename_lfn(const char *filename1, const char *filename2, int drive)
   char buf[PATH_MAX];
 
   Debug0((dbg_fd, "Rename file fn1=%s fn2=%s\n", filename1, filename2));
-  if (drives[drive].read_only)
+  if (read_only(drives[drive]))
     return ACCESS_DENIED;
   build_ufs_path_(fpath, filename2, drive, 0);
   if (find_file(fpath, &st, drive, NULL) || is_dos_device(fpath)) {
@@ -3223,7 +3317,11 @@ static int validate_mode(char *fpath, struct vm86_regs *state, int drive,
     *unix_mode = O_WRONLY;
   }
   else if (dos_mode == READ_WRITE_ACC) {
-    *unix_mode = O_RDWR;
+    /* for cdrom don't return error but downgrade mode to avoid open() error */
+    if (cdrom(drives[drive]))
+      *unix_mode = O_RDONLY;
+    else
+      *unix_mode = O_RDWR;
   }
   else if (dos_mode == 0x40) { /* what's this mode ?? */
     *unix_mode = O_RDWR;
@@ -3232,7 +3330,7 @@ static int validate_mode(char *fpath, struct vm86_regs *state, int drive,
     Debug0((dbg_fd, "Illegal access_mode 0x%x\n", dos_mode));
     *unix_mode = O_RDONLY;
   }
-  if (drives[drive].read_only && dos_mode != READ_ACC) {
+  if (read_only(drives[drive]) && dos_mode != READ_ACC) {
     SETWORD(&(state->eax), ACCESS_DENIED);
     return (FALSE);
   }
@@ -3262,24 +3360,25 @@ static void do_update_sft(char *fpath, char *fname, char *fext, sft_t sft,
     sft_directory_entry(sft) = 0;
     sft_directory_sector(sft) = 0;
     sft_attribute_byte(sft) = attr;
-    sft_device_info(sft) = (drive & 0x1f) + (0x8040);
+    sft_device_info(sft) = (drive & 0x1f) | 0x8940;
     fstat(fd, &st);
     time_to_dos(st.st_mtime, &sft_date(sft),
 		&sft_time(sft));
 
     sft_size(sft) = st.st_size;
     sft_position(sft) = 0;
-    for (cnt = 0; cnt < 255; cnt++)
+    for (cnt = 0; cnt < MAX_OPENED_FILES; cnt++)
     {
       if (open_files[cnt].name == NULL) {
-        open_files[cnt].name = strdup(fpath);
-        open_files[cnt].fd = fd;
-        open_files[cnt].type = ftype;
+        struct file_fd *f = &open_files[cnt];
+        f->name = strdup(fpath);
+        f->fd = fd;
+        f->type = ftype;
         sft_fd(sft) = cnt;
         break;
       }
     }
-    if (cnt == 255)
+    if (cnt == MAX_OPENED_FILES)
     {
       error("Panic: too many open files\n");
       leavedos(1);
@@ -3335,7 +3434,8 @@ static int dos_fs_redirect(struct vm86_regs *state)
 
   sft = LINEAR2UNIX(SEGOFF2LINEAR(SREG(es), LWORD(edi)));
 
-  Debug0((dbg_fd, "Entering dos_fs_redirect, FN=%02X\n", (int)LOW(state->eax)));
+  Debug0((dbg_fd, "Entering dos_fs_redirect, FN=%02X, '%s'\n",
+          (int)LOW(state->eax), redirector_op_to_str(LOW(state->eax))));
 
   /*
    * We need to update the pointers here as some variants of DOS move it
@@ -3412,10 +3512,12 @@ static int dos_fs_redirect(struct vm86_regs *state)
       Debug0((dbg_fd, "New CWD is %s\n", filename1));
       return TRUE;
 
-    case CLOSE_FILE: /* 0x06 */
+    case CLOSE_FILE: { /* 0x06 */
+      struct file_fd *f;
       cnt = sft_fd(sft);
-      filename1 = open_files[cnt].name;
-      fd = open_files[cnt].fd;
+      f = &open_files[cnt];
+      filename1 = f->name;
+      fd = f->fd;
       Debug0((dbg_fd, "Close file %x (%s)\n", fd, filename1));
       Debug0((dbg_fd, "Handle cnt %d\n", sft_handle_cnt(sft)));
       sft_handle_cnt(sft)--;
@@ -3427,11 +3529,11 @@ static int dos_fs_redirect(struct vm86_regs *state)
         Debug0((dbg_fd, "Close file fails\n"));
         if (filename1 != NULL) {
           free(filename1);
-          open_files[cnt].name = NULL;
+          f->name = NULL;
         }
         return FALSE;
       }
-      if (open_files[cnt].type == TYPE_PRINTER) {
+      if (f->type == TYPE_PRINTER) {
         printer_close(fd);
         Debug0((dbg_fd, "printer %i closed\n", fd));
       } else {
@@ -3459,9 +3561,10 @@ static int dos_fs_redirect(struct vm86_regs *state)
       }
       if (filename1 != NULL) {
         free(filename1);
-        open_files[cnt].name = NULL;
+        f->name = NULL;
       }
       return TRUE;
+    }
 
     case READ_FILE: { /* 0x08 */
       int return_val;
@@ -3504,7 +3607,7 @@ static int dos_fs_redirect(struct vm86_regs *state)
     }
 
     case WRITE_FILE: /* 0x09 */
-      if (open_files[sft_fd(sft)].name == NULL || drives[drive].read_only) {
+      if (open_files[sft_fd(sft)].name == NULL || read_only(drives[drive])) {
         SETWORD(&(state->eax), ACCESS_DENIED);
         return FALSE;
       }
@@ -3623,7 +3726,7 @@ static int dos_fs_redirect(struct vm86_regs *state)
       u_short att = *(u_short *)Stk_Addr(state, ss, esp);
 
       Debug0((dbg_fd, "Set File Attributes %s 0%o\n", filename1, att));
-      if (drives[drive].read_only || is_long_path(filename1)) {
+      if (read_only(drives[drive]) || is_long_path(filename1)) {
         SETWORD(&(state->eax), ACCESS_DENIED);
         return FALSE;
       }
@@ -3680,10 +3783,8 @@ static int dos_fs_redirect(struct vm86_regs *state)
       de = &dir_list->de[0];
       ret = 0;
       for (i = 0; i < dir_list->nr_entries; i++, de++) {
-        if ((de->mode & S_IFMT) == S_IFREG) {
-          strcpy(fpath + cnt, de->d_name);
-          ret |= dos_rename(fpath, filename2, drive);
-        }
+        strcpy(fpath + cnt, de->d_name);
+        ret |= dos_rename(fpath, filename2, drive);
       }
       free(dir_list->de);
       free(dir_list);
@@ -3701,7 +3802,7 @@ static int dos_fs_redirect(struct vm86_regs *state)
       struct dir_ent *de;
 
       Debug0((dbg_fd, "Delete file %s\n", filename1));
-      if (drives[drive].read_only) {
+      if (read_only(drives[drive])) {
         SETWORD(&(state->eax), ACCESS_DENIED);
         return FALSE;
       }
@@ -3815,7 +3916,7 @@ static int dos_fs_redirect(struct vm86_regs *state)
 
       Debug0((dbg_fd, "Open existing file %s\n", filename1));
 
-      if (drives[drive].read_only && dos_mode != READ_ACC) {
+      if (read_only(drives[drive]) && dos_mode != READ_ACC) {
         SETWORD(&(state->eax), ACCESS_DENIED);
         return FALSE;
       }
@@ -3848,7 +3949,7 @@ do_open_existing:
         }
         if (!share(fd, unix_mode & O_ACCMODE, drive, sft)) {
           close(fd);
-          SETWORD(&(state->eax), ACCESS_DENIED);
+          SETWORD(&(state->eax), SHARING_VIOLATION);
           return FALSE;
         }
         ftype = TYPE_DISK;
@@ -3861,7 +3962,8 @@ do_open_existing:
       /* If FCB open requested, we need to call int2f 0x120c */
       if (FCBcall) {
         Debug0((dbg_fd, "FCB Open calling int2f 0x120c\n"));
-        fake_int_to(FCB_HLP_SEG, FCB_HLP_OFF);
+        fake_call_to(FCB_HLP_SEG, FCB_HLP_OFF);
+        return UNCHANGED;
       }
 
       return TRUE;
@@ -3902,7 +4004,7 @@ do_open_existing:
       }
 
 do_create_truncate:
-      if (drives[drive].read_only) {
+      if (read_only(drives[drive])) {
         SETWORD(&(state->eax), ACCESS_DENIED);
         return FALSE;
       }
@@ -3969,7 +4071,8 @@ do_create_truncate:
       /* If FCB open requested, we need to call int2f 0x120c */
       if (FCBcall) {
         Debug0((dbg_fd, "FCB Open calling int2f 0x120c\n"));
-        fake_int_to(FCB_HLP_SEG, FCB_HLP_OFF);
+        fake_call_to(FCB_HLP_SEG, FCB_HLP_OFF);
+        return UNCHANGED;
       }
       return TRUE;
 
@@ -4024,20 +4127,22 @@ do_create_truncate:
 
       bs_pos = getbasename(fpath);
       *bs_pos = '\0';
-      /* for efficiency we don't read everything if there are no wildcards */
-      if (!memchr(sdb_template_name(sdb), '?', 8) && !memchr(sdb_template_ext(sdb), '?', 3)) {
-        hlist = get_dir(fpath, sdb_template_name(sdb), sdb_template_ext(sdb), drive);
-        bs_pos = NULL;
-      } else
-        hlist = get_dir(fpath, NULL, NULL, drive);
+
+      if (!find_file(fpath, &st, drive, NULL)) {
+        Debug0((dbg_fd, "get_dir(): find_file() returned false for '%s'\n", fpath));
+        SETWORD(&(state->eax), PATH_NOT_FOUND);
+        return FALSE;
+      }
+      hlist = get_dir_ff(fpath, sdb_template_name(sdb), sdb_template_ext(sdb), drive);
       if (hlist == NULL) {
         SETWORD(&(state->eax), NO_MORE_FILES);
         return FALSE;
       }
+
       if (long_path) {
         set_long_path_on_dirs(hlist);
       }
-      hlist_index = hlist_push(hlist, sda_cur_psp(sda), bs_pos ? fpath : "");
+      hlist_index = hlist_push(hlist, sda_cur_psp(sda), fpath);
       sdb_dir_entry(sdb) = 0;
       sdb_p_cluster(sdb) = hlist_index;
 
@@ -4092,7 +4197,7 @@ do_create_truncate:
       return TRUE;
 
     case SEEK_FROM_EOF: { /* 0x21 */
-      off_t offset = (WORD(state->ecx) << 16) | WORD(state->edx);
+      off_t offset = (int32_t)((WORD(state->ecx) << 16) | WORD(state->edx));
 
       if (open_files[sft_fd(sft)].name == NULL) {
         SETWORD(&(state->eax), ACCESS_DENIED);
@@ -4103,7 +4208,7 @@ do_create_truncate:
       if (offset > 0)
         offset = -offset;
       offset = lseek(fd, offset, SEEK_END);
-      Debug0((dbg_fd, "Seek returns fs=%d ofs=%lld\n", fd, (long long)offset));
+      Debug0((dbg_fd, "Seek returns fd=%x ofs=%lld\n", fd, (long long)offset));
       if (offset != -1) {
         sft_position(sft) = offset;
         SETWORD(&(state->edx), offset >> 16);
@@ -4218,7 +4323,7 @@ do_create_truncate:
           /* XXXTRB - need to support redirection index pass-thru */
         case GET_REDIRECTION:
         case EXTENDED_GET_REDIRECTION:
-          return GetRedirection(state, WORD(state->ebx));
+          return GetRedirection(state);
         case REDIRECT_DEVICE:
           return DoRedirectDevice(state);
         case CANCEL_REDIRECTION:
@@ -4252,7 +4357,7 @@ do_create_truncate:
       if (strncasecmp(filename1, LINUX_PRN_RESOURCE, strlen(LINUX_PRN_RESOURCE)) == 0)
         goto do_open_existing;
 
-      if (drives[drive].read_only && dos_mode != READ_ACC) {
+      if (read_only(drives[drive]) && dos_mode != READ_ACC) {
         SETWORD(&(state->eax), ACCESS_DENIED);
         return FALSE;
       }
@@ -4328,6 +4433,51 @@ do_create_truncate:
       SETWORD(&(state->ebx), WORD(state->ebx) - redirected_drives);
       Debug0((dbg_fd, "Passing %d to PRINTER SETUP CALL\n", (int)WORD(state->ebx)));
       return REDIRECT;
+
+    case GET_LARGE_FILE_INFO: {
+      /* ES:DI - SFT
+       * DS:DX -> buffer for file information (see #01784)
+       */
+      int fd;
+      unsigned long long wtime;
+      unsigned int buffer = SEGOFF2LINEAR(_DS, _DX);
+
+      d_printf("MFS: get large file info\n");
+      cnt = sft_fd(sft);
+      if (!open_files[cnt].name) {
+        d_printf("LFN: handle lookup failed\n");
+        return FALSE;
+      }
+      fd = open_files[cnt].fd;
+      d_printf("found %s on fd %i\n", open_files[cnt].name, fd);
+
+      if (fstat(fd, &st))
+        return FALSE;
+
+      WRITE_DWORD(buffer, get_dos_attr_fd(fd, st.st_mode,
+					    is_hidden(open_files[cnt].name)));
+#define unix_to_win_time(ut) \
+( \
+  ((unsigned long long)ut + (369 * 365 + 89)*24*60*60ULL) * 10000000 \
+)
+      wtime = unix_to_win_time(st.st_ctime);
+      WRITE_DWORD(buffer + 4, wtime);
+      WRITE_DWORD(buffer + 8, wtime >> 32);
+      wtime = unix_to_win_time(st.st_atime);
+      WRITE_DWORD(buffer + 0xc, wtime);
+      WRITE_DWORD(buffer + 0x10, wtime >> 32);
+      wtime = unix_to_win_time(st.st_mtime);
+      WRITE_DWORD(buffer + 0x14, wtime);
+      WRITE_DWORD(buffer + 0x18, wtime >> 32);
+      WRITE_DWORD(buffer + 0x1c, st.st_dev); /*volume serial number*/
+      WRITE_DWORD(buffer + 0x20, (unsigned long long)st.st_size >> 32);
+      WRITE_DWORD(buffer + 0x24, st.st_size);
+      WRITE_DWORD(buffer + 0x28, st.st_nlink);
+      /* fileid*/
+      WRITE_DWORD(buffer + 0x2c, (unsigned long long)st.st_ino >> 32);
+      WRITE_DWORD(buffer + 0x30, st.st_ino);
+      return TRUE;
+    }
 
     default:
       Debug0((dbg_fd, "Default for undocumented function: %02x\n", (int)LOW(state->eax)));

@@ -37,7 +37,9 @@ BuildRequires: xorg-x11-font-utils
 BuildRequires: linuxdoc-tools
 BuildRequires: coreutils
 BuildRequires: readline-devel
+BuildRequires: json-c-devel
 BuildRequires: binutils-devel
+BuildRequires: pkgconf-pkg-config
 BuildRequires: fdpp
 
 # the below is not strictly required, as dosemu can dynamically
@@ -53,8 +55,11 @@ Recommends: gpm-libs
 Recommends: libao
 Recommends: ladspa
 Recommends: slang
+Recommends: ncurses-base
 Recommends: readline
-Recommends: fdpp
+Recommends: json-c
+Requires: fdpp
+Requires: comcom32
 
 # cannot coexist with dosemu1
 Conflicts:  dosemu
@@ -69,8 +74,8 @@ under Linux.
 
 %build
 ./autogen.sh
-./default-configure --prefix=%{_prefix} --libdir=%{_libdir} \
-	--sysconfdir=%{_sysconfdir} --enable-debug
+./configure --prefix=%{_prefix} --libdir=%{_libdir} \
+	--sysconfdir=%{_sysconfdir} --enable-debug --disable-xbacktrace
 # can't use %%configure because of this:
 # https://bugzilla.redhat.com/show_bug.cgi?id=1343892
 # additionally have to use double-percent for comments:

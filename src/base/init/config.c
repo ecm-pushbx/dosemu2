@@ -23,11 +23,11 @@
 #include "dosemu_config.h"
 #include "init.h"
 #include "disks.h"
-#include "userhook.h"
 #include "pktdrvr.h"
 #include "speaker.h"
 #include "sound/sound.h"
 #include "keyboard/keyb_clients.h"
+#include "translate/dosemu_charset.h"
 #include "dos2linux.h"
 #include "utilities.h"
 #ifdef X86_EMULATOR
@@ -79,6 +79,7 @@ const char *dosemu_midi_path = "~/" LOCALDIR_BASE_NAME "/run/" DOSEMU_MIDI;
 const char *dosemu_midi_in_path = "~/" LOCALDIR_BASE_NAME "/run/" DOSEMU_MIDI_IN;
 char *dosemu_map_file_name;
 char *fddir_default;
+char *comcom_dir;
 char *fddir_boot;
 char *commands_path;
 struct config_info config;
@@ -210,8 +211,7 @@ void dump_config_status(void (*printfunc)(const char *, ...))
     (*print)("SDL_hwrend %d\n", config.sdl_hwrend);
     (*print)("vesamode_list %p\nX_lfb %d\nX_pm_interface %d\n",
         config.vesamode_list, config.X_lfb, config.X_pm_interface);
-    (*print)("X_keycode %d\nX_font \"%s\"\n",
-        config.X_keycode, config.X_font);
+    (*print)("X_font \"%s\"\n", config.X_font);
     (*print)("X_mgrab_key \"%s\"\n",  config.X_mgrab_key);
     (*print)("X_background_pause %d\n", config.X_background_pause);
 
@@ -309,6 +309,8 @@ void dump_config_status(void (*printfunc)(const char *, ...))
     (*print)("\ncli_timeout %d\n", config.cli_timeout);
     (*print)("\nJOYSTICK:\njoy_device0 \"%s\"\njoy_device1 \"%s\"\njoy_dos_min %i\njoy_dos_max %i\njoy_granularity %i\njoy_latency %i\n",
         config.joy_device[0], config.joy_device[1], config.joy_dos_min, config.joy_dos_max, config.joy_granularity, config.joy_latency);
+    (*print)("\nFS:\nset_int_hooks %i\nforce_int_revect %i\nforce_fs_redirect %i\n\n",
+        config.int_hooks, config.force_revect, config.force_redir);
 
     if (!printfunc) {
       (*print)("\n--------------end of runtime configuration dump -------------\n");
@@ -349,6 +351,137 @@ static void our_envs_init(void)
     setenv("DOSEMU_EUID", buf, 1);
     sprintf(buf, "%d", getuid());
     setenv("DOSEMU_UID", buf, 1);
+}
+
+static int check_comcom(const char *dir)
+{
+  char *path;
+  int err;
+
+  path = assemble_path(dir, "command.com");
+  err = access(path, R_OK);
+  free(path);
+  if (err == 0)
+    return 1;
+  path = assemble_path(dir, "comcom32.exe");
+  err = access(path, R_OK);
+  free(path);
+  if (err == 0)
+    error("comcom32 found in %s but command.com symlink is missing\n", dir);
+  return 0;
+}
+
+static void comcom_hook(struct sys_dsc *sfiles, fatfs_t *fat)
+{
+  char buf[1024];
+  char *comcom;
+  ssize_t res;
+  const char *dir = fatfs_get_host_dir(fat);
+
+  if (strcmp(dir, comcom_dir) == 0) {
+    sfiles[CMD_IDX].flags |= FLG_COMCOM32;
+    return;
+  }
+  comcom = assemble_path(dir, "command.com");
+  res = readlink(comcom, buf, sizeof(buf));
+  free(comcom);
+  if (res == -1)
+    return;
+  if (strncmp(buf, comcom_dir, strlen(comcom_dir)) != 0)
+    return;
+  sfiles[CMD_IDX].flags |= FLG_COMCOM32;
+}
+
+static void set_freedos_dir(void)
+{
+  char *fddir;
+  char *ccdir;
+#ifdef USE_FDPP
+  if (load_plugin("fdpp"))
+    c_printf("fdpp: plugin loaded\n");
+  else
+    error("can't load fdpp\n");
+#endif
+
+  if (!fddir_boot) {
+    config.try_freedos = 1;
+    fddir_boot = assemble_path(dosemu_lib_dir_path, FDBOOT_DIR);
+  }
+  if (access(fddir_boot, R_OK | X_OK) == 0) {
+    setenv("FDBOOT_DIR", fddir_boot, 1);
+    setenv("DOSEMU2_DRIVE_E", fddir_boot, 1);
+  } else {
+    error("Directory %s does not exist\n", fddir_boot);
+    free(fddir_boot);
+    fddir_boot = NULL;
+  }
+
+  ccdir = getenv("DOSEMU2_COMCOM_DIR");
+  if (ccdir && access(ccdir, R_OK | X_OK) == 0 && check_comcom(ccdir)) {
+    comcom_dir = strdup(ccdir);
+  } else {
+    const char *comcom[] = {
+      "/usr/share/comcom32",
+      "/usr/local/share/comcom32",
+      "/opt/comcom32",			/* gentoo */
+      NULL,
+    };
+    int i;
+    for (i = 0; comcom[i]; i++) {
+      if (access(comcom[i], R_OK | X_OK) == 0 && check_comcom(comcom[i])) {
+        comcom_dir = strdup(comcom[i]);
+        break;
+      }
+    }
+  }
+  if (comcom_dir) {
+    fatfs_set_sys_hook(comcom_hook);
+    setenv("DOSEMU2_DRIVE_F", comcom_dir, 1);
+  }
+
+  fddir = getenv("DOSEMU2_FREEDOS_DIR");
+  if (fddir && access(fddir, R_OK | X_OK) == 0) {
+    fddir_default = strdup(fddir);
+  } else {
+    fddir = assemble_path(dosemu_lib_dir_path, FREEDOS_DIR);
+    if (access(fddir, R_OK | X_OK) == 0)
+      fddir_default = fddir;
+    else
+      free(fddir);
+  }
+  if (fddir_default)
+    setenv("DOSEMU2_DRIVE_G", fddir_default, 1);
+
+  if (!fddir_default && !comcom_dir)
+    error("Neither FreeDOS nor comcom32 installation found.\n"
+        "Use DOSEMU2_FREEDOS_DIR env var to specify alternative location.\n");
+}
+
+static void move_dosemu_lib_dir(void)
+{
+  char *old_cmd_path;
+
+  setenv("DOSEMU2_DRIVE_C", dosemu_drive_c_path, 1);
+  setenv("DOSEMU_LIB_DIR", dosemu_lib_dir_path, 1);
+  set_freedos_dir();
+  commands_path = assemble_path(dosemu_lib_dir_path, CMDS_SUFF);
+  if (access(commands_path, R_OK | X_OK) == 0) {
+    setenv("DOSEMU2_DRIVE_D", commands_path, 1);
+  } else {
+    error("dosemu2 commands not found at %s\n", commands_path);
+    free(commands_path);
+    commands_path = NULL;
+  }
+  old_cmd_path = assemble_path(dosemu_lib_dir_path, "dosemu2-cmds-0.1");
+  if (access(old_cmd_path, R_OK | X_OK) == 0)
+    setenv("DOSEMU_COMMANDS_DIR", old_cmd_path, 1);
+  else if (commands_path)
+    setenv("DOSEMU_COMMANDS_DIR", commands_path, 1);
+  free(old_cmd_path);
+
+  if (keymap_load_base_path != keymaploadbase_default)
+    free(keymap_load_base_path);
+  keymap_load_base_path = assemble_path(dosemu_lib_dir_path, "");
 }
 
 static int find_option(const char *option, int argc, char **argv)
@@ -437,6 +570,7 @@ void secure_option_preparse(int *argc, char **argv)
     if (opt1) {
       replace_string(CFG_STORE, dosemu_image_dir_path, opt1);
       dosemu_image_dir_path = opt1;
+      config.alt_drv_c = 1;
     } else {
       error("--Fimagedir: %s does not exist\n", opt);
     }
@@ -562,7 +696,8 @@ static void read_cpu_info(void)
         error("Unknown CPU type!\n");
 	/* config.realcpu is set to CPU_386 at this point */
     }
-    config.mathco = strcmp(get_proc_string_by_key("fpu"), "yes") == 0;
+    if (config.mathco)
+      config.mathco = strcmp(get_proc_string_by_key("fpu"), "yes") == 0;
     reset_proc_bufferptr();
     k = 0;
     while (get_proc_string_by_key("processor")) {
@@ -575,8 +710,25 @@ static void read_cpu_info(void)
     close_proc_scan();
 }
 
+const char *(*get_charset_for_lang)(const char *path, const char *lc);
+
 static void config_post_process(void)
 {
+#ifdef X86_EMULATOR
+    char buf[256];
+    size_t n;
+    FILE *f = popen("uname -r", "r");
+    n = fread(buf, 1, sizeof(buf) - 1, f);
+    buf[n >= 0 ? n : 0] = 0;
+    if (strstr(buf, "Microsoft") != NULL) {
+	c_printf("CONF: Running on Windows, SIM CPUEMU enabled\n");
+	config.cpusim = 1;
+	config.cpuemu = 4;
+	config.cpu_vm = CPUVM_EMU;
+	config.cpu_vm_dpmi = CPUVM_EMU;
+    }
+    pclose(f);
+#endif
     config.realcpu = CPU_386;
     if (vm86s.cpu_type > config.realcpu || config.rdtsc || config.mathco)
 	read_cpu_info();
@@ -681,8 +833,10 @@ static void config_post_process(void)
 	}
 #endif
     }
-    if (!config.dpmi)
+    if (!config.dpmi || !config.ems_size || config.ems_uma_pages < 4) {
+	warn("CONF: disabling DPMI DOS support\n");
 	config.pm_dos_api = 0;
+    }
 
     /* page-align memory sizes */
     config.ext_mem &= ~3;
@@ -708,11 +862,42 @@ static void config_post_process(void)
     }
 #endif
 
+    /* for now they can't work together */
+    if (config.ne2k && config.pktdrv) {
+        c_printf("CONF: Warning: disabling packet driver because of ne2k\n");
+        config.pktdrv = 0;
+    }
+
     check_for_env_autoexec_or_config();
 
     if (config.pci && !can_do_root_stuff) {
         c_printf("CONF: Warning: PCI requires root, disabled\n");
         config.pci = 0;
+    }
+
+    if (!config.internal_cset) {
+#if LOCALE_PLUGIN
+        const char *lang = getenv("LANG");
+        load_plugin("json");
+        if (get_charset_for_lang && lang) {
+            char *l2 = strdup(lang);
+            char *dot = strchr(l2, '.');
+            char *path = assemble_path(dosemu_lib_dir_path, "locales.conf");
+            const char *cp;
+            if (dot)
+                *dot = '\0';
+            cp = get_charset_for_lang(path, l2);
+            if (cp)
+                set_internal_charset(cp);
+            else
+                error("Can't find codepage for \"%s\".\n"
+                      "Please add the mapping to locales.conf and send patch.\n",
+                      l2);
+            free(path);
+        }
+#else
+        set_internal_charset("cp437");
+#endif
     }
 }
 
@@ -801,13 +986,16 @@ void
 config_init(int argc, char **argv)
 {
     int             c=0;
-    int             i_incr = 0;
+#define I_MAX 5
+    int             i_incr[I_MAX] = {};
+    int             i_found = 0;
+    int             i_cur;
     int             can_do_root_stuff_enabled = 0;
     const char     *confname = NULL;
     char           *dosrcname = NULL;
     char           *basename;
     const char * const getopt_string =
-       "23456ABCcD:dE:e:F:f:H:hI:i::K:k::L:M:mNOo:P:qSsTt::u:VvwXx:U:"
+       "23456ABCcD:dE:e:F:f:H:hI:K:k::L:M:mNOo:P:qSsTt::u:VvwXx:U:Y"
        "gp"/*NOPs kept for compat (not documented in usage())*/;
 
     if (getenv("DOSEMU_INVOKED_NAME"))
@@ -879,6 +1067,7 @@ config_init(int argc, char **argv)
 	    }
 	    break;
 	case 'I':
+	    assert(i_found < I_MAX);
 	    commandline_statements = strdup(optarg);
 	    if (commandline_statements[0] == '\'') {
 		commandline_statements[0] = ' ';
@@ -889,22 +1078,14 @@ config_init(int argc, char **argv)
 		    strcat(commandline_statements, " ");
 		    strcat(commandline_statements, argv[optind]);
 		    optind++;
-		    i_incr++;
+		    i_incr[i_found]++;
 		}
 		commandline_statements[strlen(commandline_statements) - 1] = 0;
 	    }
-	    break;
-	case 'i':
-	    if (optarg)
-		config.install = optarg;
-	    else
-		config.install = "";
+	    i_found++;
 	    break;
 	case 'd':
 	    config.detach = 1;
-	    break;
-	case 'D':
-	    parse_debugflags(optarg, 1);
 	    break;
 	case 'O':
 	    fprintf(stderr, "using stderr for debug-output\n");
@@ -957,6 +1138,7 @@ config_init(int argc, char **argv)
 
     if (config_check_only) set_debug_level('c',1);
 
+    move_dosemu_lib_dir();
     parse_config(confname,dosrcname);
 
     if (config.exitearly && !config_check_only)
@@ -965,6 +1147,7 @@ config_init(int argc, char **argv)
     /* default settings before processing cmdline */
     config.exit_on_cmd = 1;
 
+    i_cur = 0;
 #ifdef __linux__
     optind = 0;
 #endif
@@ -974,7 +1157,6 @@ config_init(int argc, char **argv)
 	case 'F':		/* previously parsed config file argument */
 	case 'f':
 	case 'H':
-	case 'i':
 	case 'd':
 	case 'o':
 	case 'O':
@@ -983,7 +1165,8 @@ config_init(int argc, char **argv)
 	case 's':
 	    break;
 	case 'I':
-	    optind += i_incr;
+	    assert(i_cur < i_found);
+	    optind += i_incr[i_cur++];
 	    break;
 	case '2': case '3': case '4': case '5': case '6':
 	    {
@@ -1064,6 +1247,9 @@ config_init(int argc, char **argv)
 	    config.vga = 1;
 	    if (config.mem_size > 640)
 		config.mem_size = 640;
+	    break;
+	case 'Y':
+	    config.dos_trace = 1;
 	    break;
 	case 'N':
 	    warn("DOS will not be started\n");
@@ -1200,6 +1386,7 @@ usage(char *basename)
 	"    -h display this help\n"
 	"    -H wait for dosdebug terminal at startup and pass dflags\n"
 	"    -k use PC console keyboard (!)\n"
+	"    -K Specify unix path for program running with -E\n"
 	"    -M set memory size to SIZE kilobytes (!)\n"
 	"    -m toggle internal mouse driver\n"
 	"    -N No boot of DOS\n"
@@ -1215,7 +1402,6 @@ usage(char *basename)
 	"    -v display version\n"
 	"    -w toggle windowed/fullscreen mode in X\n"
 	"    -x SIZE enable SIZE K XMS RAM\n"
-	"    -U PIPES calls init_uhook(PIPES) (??\?)\n"  /* "??)" is a trigraph */
 	"\n"
 	"    (!) BE CAREFUL! READ THE DOCS FIRST!\n"
 	"    (%%) require DOSEMU be run as root (i.e. suid)\n"
@@ -1233,3 +1419,66 @@ usage(char *basename)
 	"  %s --version    print version of dosemu (and show this help)\n",
         basename, basename);
 }
+
+
+	/* charset */
+static struct char_set *get_charset(const char *name)
+{
+	struct char_set *charset;
+
+	charset = lookup_charset(name);
+	if (!charset) {
+		error("Can't find charset %s", name);
+	}
+	return charset;
+
+}
+
+void set_external_charset(const char *charset_name)
+{
+	struct char_set *charset;
+	charset = get_charset(charset_name);
+	if (!charset) {
+		error("charset %s not available\n", charset_name);
+		return;
+	}
+	charset = get_terminal_charset(charset);
+	if (charset) {
+		if (!trconfig.output_charset) {
+			trconfig.output_charset = charset;
+		}
+		if (!trconfig.keyb_charset) {
+			trconfig.keyb_charset = charset;
+		}
+	}
+
+	config.external_cset = charset_name;
+}
+
+void set_internal_charset(const char *charset_name)
+{
+	struct char_set *charset_video, *charset_config;
+	charset_video = get_charset(charset_name);
+	if (!charset_video) {
+		error("charset %s not available\n", charset_name);
+		return;
+	}
+	if (!is_display_charset(charset_video)) {
+		error("%s not suitable as an internal charset", charset_name);
+	}
+	charset_config = get_terminal_charset(charset_video);
+	if (charset_video && !trconfig.video_mem_charset) {
+		trconfig.video_mem_charset = charset_video;
+	}
+#if 0
+	if (charset_config && !trconfig.keyb_config_charset) {
+		trconfig.keyb_config_charset = charset_config;
+	}
+#endif
+	if (charset_config && !trconfig.dos_charset) {
+		trconfig.dos_charset = charset_config;
+	}
+
+	config.internal_cset = charset_name;
+}
+

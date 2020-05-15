@@ -474,10 +474,7 @@ int VGA_emulate_outb(ioport_t, Bit8u);
 int VGA_emulate_outw(ioport_t, Bit16u);
 Bit8u VGA_emulate_inb(ioport_t);
 Bit16u VGA_emulate_inw(ioport_t);
-#ifdef __linux__
-int vga_emu_fault(sigcontext_t *, int pmode);
-#define VGA_EMU_FAULT(scp,code,pmode) vga_emu_fault(scp,pmode)
-#endif
+int vga_emu_fault(dosaddr_t, unsigned, sigcontext_t *);
 int vga_emu_pre_init(void);
 int vga_emu_init(int src_modes, struct ColorSpaceDesc *);
 void vga_emu_done(void);
@@ -510,6 +507,7 @@ unsigned char vga_read(unsigned addr);
 void vga_write(unsigned addr, unsigned char val);
 unsigned short vga_read_word(unsigned addr);
 void vga_write_word(unsigned addr, unsigned short val);
+unsigned vga_read_dword(unsigned addr);
 void vga_write_dword(dosaddr_t addr, unsigned val);
 void memcpy_to_vga(unsigned dst, const void *src, size_t len);
 void memcpy_dos_to_vga(unsigned dst, unsigned src, size_t len);

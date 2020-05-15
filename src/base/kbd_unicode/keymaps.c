@@ -40,7 +40,7 @@ int X11_DetectLayout (void);
  * superset of unicode.
  * Things particular to this superset are:
  * U_VOID is used to represent the lack of a value:
- * The range 0xE000 - 0xEFFF is the unicode private space (so dosemu
+ * The range 0xE000 - 0xEFFF is the unicode private space, so dosemu
  * makes use of it.
  * 0xEF00 - 0xEFFF is used as a pass through to the locally configured
  * character set.
@@ -269,7 +269,7 @@ CONST t_keysym shift_map_uk[] =
 
 CONST t_keysym alt_map_uk[] =
 {
-  U_VOID, U_VOID, U_VOID, '@', U_VOID, '$', U_VOID, U_VOID,
+  U_VOID, U_VOID, U_VOID, '@', U_VOID, U_EURO_SIGN, U_VOID, U_VOID,
   '{', '[', ']', '}', '\\', U_VOID, U_VOID, U_VOID,
   U_VOID, U_VOID, U_VOID, U_VOID, U_VOID, U_VOID, U_VOID, U_VOID,
   U_VOID, U_VOID, U_VOID, '~', 13, U_VOID, U_VOID, U_VOID,
@@ -399,7 +399,7 @@ CONST t_keysym alt_map_de_latin1[] =
 {
   U_VOID, U_VOID, U_VOID, 0xeffd, 0xeffc, '$', U_VOID, U_VOID,
   '{', '[', ']', '}', '\\', U_VOID, U_VOID, U_VOID,
-  '@', U_VOID, U_VOID, U_VOID, U_VOID, U_VOID, U_VOID, U_VOID,
+  '@', U_VOID, U_EURO_SIGN, U_VOID, U_VOID, U_VOID, U_VOID, U_VOID,
   U_VOID, U_VOID, U_VOID, '~', 13, U_VOID, U_VOID, U_VOID,
   U_VOID, U_VOID, U_VOID, U_VOID, U_VOID, U_VOID, U_VOID, U_VOID,
   U_VOID, U_VOID, U_VOID, U_VOID, U_VOID, U_VOID, U_VOID, U_VOID,
@@ -501,7 +501,7 @@ CONST t_keysym alt_map_fr_latin1[] =
 {
   U_VOID, U_VOID, U_VOID, '~', '#', '{', '[', '|',
   '`', '\\', '^', '@', ']', '}', U_VOID, U_VOID,
-  '@', U_VOID, U_VOID, U_VOID, U_VOID, U_VOID, U_VOID, U_VOID,
+  '@', U_VOID, U_EURO_SIGN, U_VOID, U_VOID, U_VOID, U_VOID, U_VOID,
   U_VOID, U_VOID, U_VOID, 0xefa4, 13, U_VOID, U_VOID, U_VOID,
   U_VOID, U_VOID, U_VOID, U_VOID, U_VOID, U_VOID, U_VOID, U_VOID,
   U_VOID, U_VOID, U_VOID, U_VOID, U_VOID, U_VOID, U_VOID, U_VOID,
@@ -2086,13 +2086,13 @@ void setup_default_keytable()
 {
   static const char *dt_name = "auto";
   static t_keysym
-	  plain_map[NUM_DKY_NUMS],
-	  shift_map[NUM_DKY_NUMS],
-	  alt_map[NUM_DKY_NUMS],
+	  plain_map[NUM_KEY_NUMS],
+	  shift_map[NUM_KEY_NUMS],
+	  alt_map[NUM_KEY_NUMS],
 	  num_map[14],
-	  ctrl_map[NUM_DKY_NUMS],
-	  shift_alt_map[NUM_DKY_NUMS],
-	  ctrl_alt_map[NUM_DKY_NUMS];
+	  ctrl_map[NUM_KEY_NUMS],
+	  shift_alt_map[NUM_KEY_NUMS],
+	  ctrl_alt_map[NUM_KEY_NUMS];
   struct keytable_entry *kt, *altkt;
   int i, idx;
 #if defined(X_SUPPORT) && defined(USE_DL_PLUGINS)
@@ -2125,7 +2125,7 @@ void setup_default_keytable()
   altkt->flags = 0;
 
   /* Initialize everything to unknown */
-  for(i = 0; i < NUM_DKY_NUMS; i++) {
+  for(i = 0; i < NUM_KEY_NUMS; i++) {
     plain_map[i] = U_VOID;
     shift_map[i] = U_VOID;
     alt_map[i] = U_VOID;
@@ -2149,7 +2149,7 @@ void setup_default_keytable()
   idx = 1;
 #ifdef X_SUPPORT
 #ifdef USE_DL_PLUGINS
-  handle = load_plugin("X");
+  handle = load_plugin("XKmaps");
   if (handle) {
     int (*X11_DetectLayout)(void) =
       (int(*)(void))dlsym(handle, "X11_DetectLayout");

@@ -25,6 +25,10 @@
 
 #define REDIR_PRINTER_TYPE    3
 #define REDIR_DISK_TYPE       4
+#define REDIR_CLIENT_SIGNATURE 0x5544             /* 'DU' */
+#define REDIR_DEVICE_READ_ONLY 0b0000000000000001 /* Same as NetWare Lite */
+                            /* 0b0000000000001110    CDROM unit number */
+#define REDIR_DEVICE_DISABLED  0b1000000000000000
 
 #define DOS_GET_REDIRECTION    0x5F02
 #define DOS_REDIRECT_DEVICE    0x5F03
@@ -47,7 +51,7 @@ int build_posix_path(char *dest, const char *src, int allowwildcards);
 #define REDVER_CQ30    4	// Microsoft Compaq v3.00 variant
 #define SDASIZE_CQ30   0x0832
 
-#define DOSEMU_EMUFS_DRIVER_VERSION 3
+#define DOSEMU_EMUFS_DRIVER_VERSION 4
 #define DOSEMU_EMUFS_DRIVER_MIN_VERSION 2
 
 #endif

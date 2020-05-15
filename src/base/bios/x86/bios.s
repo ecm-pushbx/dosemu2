@@ -31,13 +31,6 @@
 
 #define _ORG(x) .org (x) - BIOS_START
 
-/* NOTE: The following definition need to be in memory.h, but at this
- *       moment they aren't, so I define them here.
- *       NEED TO BE CLEANED UP !
- */
-		/* out of xms.h */
-#define INT2F_XMS_MAGIC         0x43  /* AH for all int 2f XMS calls */
-
 .code16
 .text
 	.globl	bios_data_start
@@ -145,11 +138,12 @@ FCB_HLP_OFF:
 	pushw	%di
 	pushw	%ax
 	movw	$0x120c,%ax
+	clc	/* this func doesnt touch CF but we need it cleared */
 	int	$0x2f
 	popw	%ax
 	popw	%di
 	popw	%es
-	iret
+	lret
 
 /* This is installed after video init (helper fcn 0x9) when the internal
 	mouse driver is in use.  It watches for mouse set commands and
@@ -161,14 +155,13 @@ FCB_HLP_OFF:
 	.globl INT10_WATCHER_OFF
 INT10_WATCHER_OFF:
 WINT10:
+	movzwl	%sp,%esp	/* make sure high of esp is zero */
 	cmpb	$1, %cs:bios_in_int10_callback
 	je	L10
 	or	%ah,%ah
 	jz	L9	/* normal mode set */
-#if 0
 	cmpb	$0x11,%ah
 	je	L9	/* character generator, possibly resize the screen */
-#endif
 	cmpw	$0x4F02,%ax
 	jne	L10	/* svga mode set */
 	pushw	%bx	/* vesa mode on stack */
@@ -185,7 +178,6 @@ L9a:
 	popw	%ax
 
 /* fake stack frame for iret: push original flags and avoid a GPF from pushf */
-	movzwl	%sp,%esp	/* make sure high of esp is zero */
 	pushw	6(%esp)
 	pushw	%cs
 	call	L10	/* perform the actual mode set */
@@ -202,6 +194,8 @@ L9a:
 	lret	$2    /* keep current flags and avoid another GPF from iret */
 
 L10:	/* chain to original handler (probably the video bios) */
+	pushw	4(%esp)
+	popf          /* sync up flags */
 	ljmp	*%cs:bios_f000_int10_old
 
         .globl MOUSE_INT33_OFF
@@ -656,6 +650,26 @@ PKTDRV_driver_entry_ip:
 PKTDRV_driver_entry_cs:
 	.word 0
 
+/* FOSSIL driver signature and jump to original handler */
+	.globl	FOSSIL_isr
+FOSSIL_isr:
+	jmp     1f
+	.globl	FOSSIL_oldisr
+FOSSIL_oldisr:
+	.long   -1
+	.globl	FOSSIL_magic
+FOSSIL_magic:
+	.word   0
+	.globl	FOSSIL_maxfun
+FOSSIL_maxfun:
+	.byte   0
+	.byte   0
+1:
+	ljmp    *%cs:FOSSIL_oldisr
+	.globl	FOSSIL_idstring
+FOSSIL_idstring:
+	.asciz  "dosemu FOSSIL emulator"
+
 	.globl LFN_HELPER_OFF
 LFN_HELPER_OFF:
 	pushw	%ds
@@ -674,6 +688,25 @@ do_int21:
         popw	%ds
         lret
 
+        .globl LFN_A6_HELPER_OFF
+LFN_A6_HELPER_OFF:
+        movw	$0x1220, %ax
+        int	$0x2f
+        jc	1f
+        movzbw	%es:(%di), %bx
+        cmpb	$0xff, %bl
+        je	2f
+        movw	$0x1216, %ax
+        int	$0x2f
+        jc	1f
+        stc
+        movw	$0x11a6, %ax
+        int	$0x2f
+1:
+        lret
+2:
+        stc
+        jmp	1b
 /* ----------------------------------------------------------------- */
 
 	.globl DBGload_OFF
@@ -696,6 +729,7 @@ DBGload_OFF:
 	movw    %ax,%si
 	movw    %ax,%di
 	movw    %ax,%bp
+	popw    %ax		/* 4b01 puts ax on stack */
 	sti
 	pushf
 	/* set TF */
@@ -834,55 +868,94 @@ int_rvc_cs_\inum:
 	.word 0x424B	// signature "KB"
 	.byte 0		// flag
 	jmp 30f		// EB xx to hwreset
-	.space 7	// padding
+int_rvc_ret_\inum:
+	.globl int_rvc_ret_ip_\inum
+int_rvc_ret_ip_\inum:
+	.word 0
+	.globl int_rvc_ret_cs_\inum
+int_rvc_ret_cs_\inum:
+	.word 0
+int_rvc_disp_\inum:
+	.globl int_rvc_disp_ip_\inum
+int_rvc_disp_ip_\inum:
+	.word 0
+	.globl int_rvc_disp_cs_\inum
+int_rvc_disp_cs_\inum:
+	.word 0
 /* header finish for IBM'S INTERRUPT-SHARING PROTOCOL */
 30: /* hwreset */
 	lret
 
 31: /* handler */
+	pushl %eax
+	pushl %ebx
 	shll $16,%eax
 	shll $16,%ebx
 	movb $DOS_HELPER_REVECT_HELPER,%al
 	movb $DOS_SUBHELPER_RVC_CALL,%bl
 	movb $0x\inum,%ah
-	movb $12,%bh		/* stack offset */
+	movb $14,%bh		/* stack offset */
 	int $DOS_HELPER_INT
+	movzwl %sp,%esp
+	movw %bx,(%esp)
+	popl %ebx
+	movw %ax,(%esp)
+	popl %eax
 	jnz 9f			/* handled */
 	jc 2f			/* second_revect */
-	ljmp *%cs:int_rvc_data_\inum
-
+	pushw 4(%esp)
+	popfw			/* re-sync flags */
+	pushfw
+	lcall *%cs:int_rvc_disp_\inum
+	jmp 9f
 2:
+	/* no flag re-sync on second-revect: CF is forced */
 	pushw %ax
 	pushfw
 	lcall *%cs:int_rvc_data_\inum
 	jnc 12f			/* handled */
-	clc
+	pushl %eax
+	pushl %ebx
+	pushl %ecx
+	pushl %edx
 	shll $16,%eax
 	shll $16,%ebx
 	shll $16,%ecx
-	popw %cx
+	shll $16,%edx
+	clc
+	movw 16(%esp),%cx	/* old AX */
+	movw 22(%esp),%dx	/* old flags */
 	movb $DOS_HELPER_REVECT_HELPER,%al
 	movb $DOS_SUBHELPER_RVC2_CALL,%bl
 	movb $0x\inum,%ah
-	movb $12,%bh		/* stack offset */
+	movb $24,%bh		/* stack offset */
 	int $DOS_HELPER_INT
+	movw %dx,(%esp)
+	popl %edx
+	movw %cx,(%esp)
+	popl %ecx
+	movw %bx,(%esp)
+	popl %ebx
+	movw %ax,(%esp)
+	popl %eax
+	/* below replaces addw $2,%sp to not corrupt CF */
+	movw %ax,(%esp)
+	popw %ax
 
 9:
-	jc 11f
-20:
-	andw $0xfffe,4(%esp)	/* clear CF */
-	iret
-11:
-	orw $1,4(%esp)		/* set CF */
-	iret
+	ljmp *%cs:int_rvc_ret_\inum
 12:
 	addw $2,%sp		/* skip saved ax */
-	jmp 20b
+	clc
+	jmp 9b
 .endm
 
 	.globl INT_RVC_21_OFF
 INT_RVC_21_OFF:
 	int_rvc 21
+	.globl INT_RVC_28_OFF
+INT_RVC_28_OFF:
+	int_rvc 28
 	.globl INT_RVC_2f_OFF
 INT_RVC_2f_OFF:
 	int_rvc 2f

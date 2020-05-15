@@ -243,7 +243,7 @@
 #include "keyboard/keyb_clients.h"
 #include "X.h"
 #include "dosemu_config.h"
-#include "x_config.h"
+#include "x_config.hh"
 #include "utilities.h"
 #include "dos2linux.h"
 #include "sig.h"
@@ -408,8 +408,6 @@ static void X_dga_done(void);
 static void X_xf86vm_init(void);
 static void X_xf86vm_done(void);
 #endif
-
-static void X_keymap_init(void);
 
 /* error/event handler */
 static int NewXErrorHandler(Display *, XErrorEvent *);
@@ -616,9 +614,6 @@ int X_init()
   X_xf86vm_init();
 #endif
 
-  /* see if we find out something useful about our X server... -- sw */
-  X_keymap_init();
-
   text_cmap = DefaultColormap(display, screen);		/* always use the global palette */
   graphics_cmap_init();				/* graphics modes are more sophisticated */
 
@@ -725,9 +720,9 @@ int X_init()
     XSetWMIconName( display, mainwindow, &prop );
     XFree( prop.value );
   }
-  xch.res_name  = "XDosEmu";
-  xch.res_class = "XDosEmu";
 
+  xch.res_name  = strdup("XDosEmu");
+  xch.res_class = strdup("XDosEmu");
   if (our_window) {
     XWMHints wmhint;
     wmhint.window_group = mainwindow;
@@ -743,6 +738,9 @@ int X_init()
   else {
     XSetClassHint(display, mainwindow, &xch);
   }
+  free(xch.res_name);
+  free(xch.res_class);
+
   /* Delete-Window-Message black magic copied from xloadimage. */
   proto_atom  = XInternAtom(display, "WM_PROTOCOLS", False);
   delete_atom = XInternAtom(display, "WM_DELETE_WINDOW", False);
@@ -1064,41 +1062,6 @@ static void X_xf86vm_done(void)
 #endif
 
 /*
- * Handle 'auto'-entries in dosemu.conf, namely
- * $_X_keycode & $_layout
- *
- */
-static void X_keymap_init()
-{
-  char *s = ServerVendor(display);
-
-  if(s) X_printf("X: X_keymap_init: X server vendor is \"%s\"\n", s);
-  if(config.X_keycode == 2 && s) {	/* auto */
-#ifdef HAVE_XKB
-    /* All I need to know is that I'm using the X keyboard extension */
-    config.X_keycode = using_xkb;
-#else
-    config.X_keycode = 0;
-
-    /*
-     * We could check some typical keycode/keysym translation; but
-     * for now we just check the server vendor. XFree & XiGraphics
-     * work. I don't know about Metro Link... -- sw
-     */
-    if(
-      strstr(s, "The XFree86 Project") ||
-      strstr(s, "Xi Graphics")
-    ) config.X_keycode = 1;
-#endif /* HAVE_XKB */
-  }
-  X_printf(
-    "X: X_keymap_init: %susing DOSEMU's internal keycode translation\n",
-    config.X_keycode ? "" : "we are not "
-  );
-}
-
-
-/*
  * This function provides an interface to reconfigure parts
  * of X and the VGA emulation during a DOSEMU session.
  * It is used by the xmode.exe program that comes with DOSEMU.
@@ -1274,14 +1237,14 @@ static void toggle_mouse_grab(void)
     XGrabPointer(display, drawwindow, True, PointerMotionMask | ButtonPressMask | ButtonReleaseMask,
                    GrabModeAsync, GrabModeAsync, drawwindow,  None, CurrentTime);
     X_set_mouse_cursor(mouse_cursor_visible, mouse_x, mouse_y, w_x_res, w_y_res);
-    mouse_enable_native_cursor(1);
+    mouse_enable_native_cursor(1, MOUSE_X);
   }
   else {
     X_printf("X: mouse grab released\n");
     XUngrabPointer(display, CurrentTime);
     X_set_mouse_cursor(mouse_cursor_visible, mouse_x, mouse_y, w_x_res, w_y_res);
-    mouse_move_absolute(mouse_x, mouse_y, w_x_res, w_y_res);
-    mouse_enable_native_cursor(0);
+    mouse_move_absolute(mouse_x, mouse_y, w_x_res, w_y_res, MOUSE_X);
+    mouse_enable_native_cursor(0, MOUSE_X);
   }
   clear_selection_data();
   X_change_config(CHG_TITLE, NULL);
@@ -1390,7 +1353,6 @@ static void toggle_fullscreen_mode(int init)
   int resize_height, resize_width;
 
   if (!init) {
-
     pthread_mutex_lock(&event_mtx);
     XUnmapWindow(display, mainwindow);
     X_wait_unmapped(mainwindow);
@@ -1425,6 +1387,8 @@ static void toggle_fullscreen_mode(int init)
       force_grab = 1;
     }
   } else {
+    Atom wm_state = XInternAtom(display, "_NET_WM_STATE", True);
+    Atom wm_fullscreen = XInternAtom(display, "_NET_WM_STATE_FULLSCREEN", True);
     X_printf("X: entering windowed mode!\n");
     w_x_res = saved_w_x_res;
     w_y_res = saved_w_y_res;
@@ -1440,6 +1404,10 @@ static void toggle_fullscreen_mode(int init)
     XMapWindow(display, mainwindow);
     X_wait_mapped(mainwindow);
     pthread_mutex_unlock(&event_mtx);
+    /* for some unclear reason, mapping normalwindow drops the
+     * props of fullscreenwindow. Restore it here */
+    XChangeProperty(display, fullscreenwindow, wm_state, XA_ATOM, 32,
+                PropModePrepend, (unsigned char *)&wm_fullscreen, 1);
     XReparentWindow(display, drawwindow, mainwindow, 0, 0);
     if (force_grab && grab_active) {
       toggle_mouse_grab();
@@ -1565,20 +1533,15 @@ static int __X_handle_events(XEvent *e)
               break;
             }
           }
-/*
-      Clears the visible selection if the cursor is inside the selection
-*/
-#if CONFIG_X_SELECTION
-	  clear_if_in_selection();
-#endif
-	  X_process_key(display, &e->xkey);
-	  break;
-
+	  /* no break; */
 	case KeyRelease:
 #if CONFIG_X_SELECTION
 	  clear_if_in_selection();
 #endif
-	  X_process_key(display, &e->xkey);
+	  if (config.X_keycode)
+	    X_keycode_process_key(display, &e->xkey);
+	  else
+	    X_process_key(display, &e->xkey);
 	  break;
 
 #if 0
@@ -1619,9 +1582,9 @@ static int __X_handle_events(XEvent *e)
 	  set_mouse_position(e->xmotion.x,e->xmotion.y); /*root@sjoerd*/
 	  set_mouse_buttons(e->xbutton.state|(0x80<<e->xbutton.button));
 	  if (e->xbutton.button == Button4)
-	    mouse_move_wheel(-1);
+	    mouse_move_wheel(-1, MOUSE_X);
 	  if (e->xbutton.button == Button5)
-	    mouse_move_wheel(1);
+	    mouse_move_wheel(1, MOUSE_X);
 	  break;
 
 	case ButtonRelease:
@@ -1655,7 +1618,7 @@ static int __X_handle_events(XEvent *e)
 	    X_printf("X: Mouse really entering window\n");
 	    if (!grab_active) {
             /* move mouse to corner */
-	      mouse_drag_to_corner(w_x_res, w_y_res);
+	      mouse_drag_to_corner(w_x_res, w_y_res, MOUSE_X);
 	      ignore_move = 1;
             } else {
 	      set_mouse_position(e->xcrossing.x, e->xcrossing.y);
@@ -2141,7 +2104,7 @@ static void X_update_cursor_pos(void)
                 &mask_return);
     if (result == False)
 	return;
-    mouse_move_absolute(win_x, win_y, w_x_res, w_y_res);
+    mouse_move_absolute(win_x, win_y, w_x_res, w_y_res, MOUSE_X);
 }
 
 /*
@@ -2468,9 +2431,9 @@ void set_mouse_position(int x, int y)
     x0 = dx + mouse_x;
     y0 = dy + mouse_y;
     XWarpPointer(display, None, drawwindow, 0, 0, 0, 0, center_x, center_y);
-    mouse_move_relative(dx, dy, w_x_res, w_y_res);
+    mouse_move_relative(dx, dy, w_x_res, w_y_res, MOUSE_X);
   } else {
-    mouse_move_absolute(x, y, w_x_res, w_y_res);
+    mouse_move_absolute(x, y, w_x_res, w_y_res, MOUSE_X);
   }
 
   mouse_x = x0;
@@ -2484,7 +2447,8 @@ void set_mouse_position(int x, int y)
  */
 void set_mouse_buttons(int state)
 {
-  mouse_move_buttons(state & Button1Mask, state & Button2Mask, state & Button3Mask);
+  mouse_move_buttons(!!(state & Button1Mask), !!(state & Button2Mask),
+    !!(state & Button3Mask), MOUSE_X);
 }
 #endif /* CONFIG_X_MOUSE */
 
@@ -2496,7 +2460,7 @@ static int X_mouse_init(void)
   if (Video != &Video_X)
     return FALSE;
   mice->type = MOUSE_X;
-  mouse_enable_native_cursor(config.X_fullscreen);
+  mouse_enable_native_cursor(config.X_fullscreen, MOUSE_X);
   m_printf("MOUSE: X Mouse being set\n");
   return TRUE;
 }
@@ -2546,6 +2510,7 @@ void kdos_close_msg()
 
 CONSTRUCTOR(static void init(void))
 {
+	load_plugin("XKmaps");
 	register_video_client(&Video_X);
 	register_mouse_client(&Mouse_X);
 }

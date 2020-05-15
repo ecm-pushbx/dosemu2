@@ -143,8 +143,12 @@ union g_reg {
 #endif
 #define LO_BYTE(wrd)		LO_BYTE_(wrd,)
 #define HI_BYTE(wrd)		HI_BYTE_(wrd,)
+#define LO_BYTE_c(wrd)		LO_BYTE_(wrd, const)
+#define HI_BYTE_c(wrd)		HI_BYTE_(wrd, const)
 #define LO_BYTE_d(wrd)	(((union dword *)&(wrd))->b.l)
 #define HI_BYTE_d(wrd)	(((union dword *)&(wrd))->b.h)
+#define LO_BYTE_dc(wrd)	(((const union dword *)&(wrd))->b.l)
+#define HI_BYTE_dc(wrd)	(((const union dword *)&(wrd))->b.h)
 
 #define _AL      LO(ax)
 #define _BL      LO(bx)
@@ -187,6 +191,8 @@ union g_reg {
 
 #define _LO(reg) LO_BYTE_d(_##e##reg)
 #define _HI(reg) HI_BYTE_d(_##e##reg)
+#define _LO_(reg) LO_BYTE_dc(_##e##reg##_)
+#define _HI_(reg) HI_BYTE_dc(_##e##reg##_)
 
 /* these are used like: LWORD(eax) = 65535 (sets ax to 65535) */
 #define LWORD(reg)	(*({ static_assert(sizeof(REGS.reg) == 4, "bad reg"); \
@@ -207,7 +213,7 @@ union g_reg {
 /* alternative SEG:OFF to linear conversion macro */
 #define SEGOFF2LINEAR(seg, off)  ((((unsigned)(seg)) << 4) + (off))
 
-#define SEG2LINEAR(seg)		LINEAR2UNIX(SEGOFF2LINEAR(seg, 0))
+#define SEG2UNIX(seg)		LINEAR2UNIX(SEGOFF2LINEAR(seg, 0))
 
 typedef unsigned int FAR_PTR;	/* non-normalized seg:off 32 bit DOS pointer */
 typedef struct {
@@ -463,7 +469,7 @@ EXTERN struct vec_t *ivecs;
 #define OP_IRET			0xcf
 
 #include "memory.h" /* for INT_OFF */
-#define IS_REDIRECTED(i)	(IVEC(i) != SEGOFF2LINEAR(BIOSSEG, INT_OFF(i)))
+//#define IS_REDIRECTED(i)	(IVEC(i) != SEGOFF2LINEAR(BIOSSEG, INT_OFF(i)))
 #define IS_IRET(i)		(READ_BYTE(IVEC(i)) == OP_IRET)
 
 /*
@@ -493,9 +499,33 @@ extern uint64_t _cr2;
 extern uint16_t _trapno;
 #define __fpstate (&(*scp)->__fs)
 #define PRI_RG  PRIx64
-#elif __x86_64__
+#elif defined(__FreeBSD__)
+#ifdef __x86_64__
+#define _rax scp->uc_mcontext.mc_rax
+#define _rbx scp->uc_mcontext.mc_rbx
+#define _rcx scp->uc_mcontext.mc_rcx
+#define _rdx scp->uc_mcontext.mc_rdx
+#define _rbp scp->uc_mcontext.mc_rbp
+#define _rsp scp->uc_mcontext.mc_rsp
+#define _rsi scp->uc_mcontext.mc_rsi
+#define _rdi scp->uc_mcontext.mc_rdi
+#define _rip scp->uc_mcontext.mc_rip
+#else
+#define _eax scp->uc_mcontext.mc_eax
+#define _ebx scp->uc_mcontext.mc_ebx
+#define _ecx scp->uc_mcontext.mc_ecx
+#define _edx scp->uc_mcontext.mc_edx
+#define _ebp scp->uc_mcontext.mc_ebp
+#define _esp scp->uc_mcontext.mc_esp
+#define _esi scp->uc_mcontext.mc_esi
+#define _edi scp->uc_mcontext.mc_edi
+#define _eip scp->uc_mcontext.mc_eip
+#endif
+#elif defined(__x86_64__)
 #define _es     (((union g_reg *)&(scp->gregs[REG_TRAPNO]))->w[1])
 #define _ds     (((union g_reg *)&(scp->gregs[REG_TRAPNO]))->w[2])
+#define _es_    (((const union g_reg *)&(scp->gregs[REG_TRAPNO]))->w[1])
+#define _ds_    (((const union g_reg *)&(scp->gregs[REG_TRAPNO]))->w[2])
 #define _rdi    (scp->gregs[REG_RDI])
 #define _rsi    (scp->gregs[REG_RSI])
 #define _rbp    (scp->gregs[REG_RBP])
@@ -519,15 +549,26 @@ extern uint16_t _trapno;
 #else
 #define _es     (scp->gregs[REG_ES])
 #define _ds     (scp->gregs[REG_DS])
-#define _rdi    (scp->gregs[REG_EDI])
-#define _rsi    (scp->gregs[REG_ESI])
-#define _rbp    (scp->gregs[REG_EBP])
-#define _rsp    (scp->gregs[REG_ESP])
-#define _rbx    (scp->gregs[REG_EBX])
-#define _rdx    (scp->gregs[REG_EDX])
-#define _rcx    (scp->gregs[REG_ECX])
-#define _rax    (scp->gregs[REG_EAX])
-#define _rip    (scp->gregs[REG_EIP])
+#define _es_    (scp->gregs[REG_ES])
+#define _ds_    (scp->gregs[REG_DS])
+#define _edi    (*(uint32_t *)&scp->gregs[REG_EDI])
+#define _esi    (*(uint32_t *)&scp->gregs[REG_ESI])
+#define _ebp    (*(uint32_t *)&scp->gregs[REG_EBP])
+#define _esp    (*(uint32_t *)&scp->gregs[REG_ESP])
+#define _ebx    (*(uint32_t *)&scp->gregs[REG_EBX])
+#define _edx    (*(uint32_t *)&scp->gregs[REG_EDX])
+#define _ecx    (*(uint32_t *)&scp->gregs[REG_ECX])
+#define _eax    (*(uint32_t *)&scp->gregs[REG_EAX])
+#define _eip    (*(uint32_t *)&scp->gregs[REG_EIP])
+#define _edi_   (*(const uint32_t *)&scp->gregs[REG_EDI])
+#define _esi_   (*(const uint32_t *)&scp->gregs[REG_ESI])
+#define _ebp_   (*(const uint32_t *)&scp->gregs[REG_EBP])
+#define _esp_   (*(const uint32_t *)&scp->gregs[REG_ESP])
+#define _ebx_   (*(const uint32_t *)&scp->gregs[REG_EBX])
+#define _edx_   (*(const uint32_t *)&scp->gregs[REG_EDX])
+#define _ecx_   (*(const uint32_t *)&scp->gregs[REG_ECX])
+#define _eax_   (*(const uint32_t *)&scp->gregs[REG_EAX])
+#define _eip_   (*(const uint32_t *)&scp->gregs[REG_EIP])
 #define _cs     (scp->gregs[REG_CS])
 #define _gs     (scp->gregs[REG_GS])
 #define _fs     (scp->gregs[REG_FS])
@@ -540,6 +581,7 @@ extern uint16_t _trapno;
 #define __fpstate (scp->fpregs)
 #define PRI_RG  PRIx32
 #endif
+#ifdef __x86_64__
 #define _edi    DWORD_(_rdi)
 #define _esi    DWORD_(_rsi)
 #define _ebp    DWORD_(_rbp)
@@ -562,6 +604,20 @@ extern uint16_t _trapno;
 #define _eip_   DWORD__(_rip, const)
 #define _eax_   DWORD__(_rax, const)
 #define _eip_   DWORD__(_rip, const)
+#else
+/* compatibility */
+#define _rdi    _edi
+#define _rsi    _esi
+#define _rbp    _ebp
+#define _rsp    _esp
+#define _rbx    _ebx
+#define _rdx    _edx
+#define _rcx    _ecx
+#define _rax    _eax
+#define _rip    _eip
+#define _rax    _eax
+#define _rip    _eip
+#endif
 
 void show_regs(void);
 void show_ints(int, int);

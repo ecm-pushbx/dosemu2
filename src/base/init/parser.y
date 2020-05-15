@@ -84,10 +84,9 @@ static int c_ser = 0;
 
 static struct disk *dptr;
 static struct disk nulldisk;
-static int c_hdisks = 0;
-static int c_fdisks = 0;
-
-char own_hostname[128];
+#define c_hdisks config.hdisks
+#define c_fdisks config.fdisks
+static int skipped_disks;
 
 static struct printer nullprt;
 static struct printer *pptr = &nullprt;
@@ -153,6 +152,7 @@ static void handle_features(int which, int value);
 static void set_joy_device(char *devstring);
 static int parse_timemode(const char *);
 static void set_hdimage(struct disk *dptr, char *name);
+static void set_drive_c(void);
 static void set_default_drives(void);
 
 	/* class stuff */
@@ -184,15 +184,6 @@ while (0)
 static void keyb_mod(int wich, t_keysym keynum, int unicode);
 static void dump_keytable_part(FILE *f, t_keysym *map, int size);
 
-
-
-#include "translate/translate.h"
-#include "translate/dosemu_charset.h"
-	/* for translate plugin */
-
-static void set_internal_charset(char *charset_name);
-static void set_external_charset(char *charset_name);
-
 enum {
 	TYPE_NONE,
 	TYPE_INTEGER,
@@ -205,8 +196,6 @@ enum {
 
 
 %start lines
-
-%pure-parser
 
 %union {
 	int i_value;
@@ -266,10 +255,10 @@ enum {
 %token PORTS DISK DOSMEM EXT_MEM
 %token L_EMS UMB_A0 UMB_B0 UMB_F0 EMS_SIZE EMS_FRAME EMS_UMA_PAGES EMS_CONV_PAGES
 %token TTYLOCKS L_SOUND L_SND_OSS L_JOYSTICK FULL_FILE_LOCKS
-%token ABORT WARN
+%token ABORT WARN ERROR
 %token L_FLOPPY EMUSYS L_X L_SDL
 %token DOSEMUMAP LOGBUFSIZE LOGFILESIZE MAPPINGDRIVER
-%token LFN_SUPPORT FFS_REDIR
+%token LFN_SUPPORT FFS_REDIR SET_INT_HOOKS FINT_REVECT
 	/* speaker */
 %token EMULATED NATIVE
 	/* cpuemu */
@@ -280,7 +269,7 @@ enum {
 %token KEYTABLE SHIFT_MAP ALT_MAP NUMPAD_MAP DUMP
 %token DGRAVE DACUTE DCIRCUM DTILDE DBREVE DABOVED DDIARES DABOVER DDACUTE DCEDILLA DIOTA DOGONEK DCARON
 	/* ipx */
-%token NETWORK PKTDRIVER
+%token NETWORK PKTDRIVER NE2K
         /* lock files */
 %token DIRECTORY NAMESTUB BINARY
 	/* serial */
@@ -289,7 +278,7 @@ enum {
 %token MICROSOFT MS3BUTTON LOGITECH MMSERIES MOUSEMAN HITACHI MOUSESYSTEMS BUSMOUSE PS2 IMPS2
 %token INTERNALDRIVER EMULATE3BUTTONS CLEARDTR
 	/* x-windows */
-%token L_DISPLAY L_TITLE X_TITLE_SHOW_APPNAME ICON_NAME X_KEYCODE X_BLINKRATE X_SHARECMAP X_MITSHM X_FONT
+%token L_DISPLAY L_TITLE X_TITLE_SHOW_APPNAME ICON_NAME X_BLINKRATE X_SHARECMAP X_MITSHM X_FONT
 %token X_FIXED_ASPECT X_ASPECT_43 X_LIN_FILT X_BILIN_FILT X_MODE13FACT X_WINSIZE
 %token X_GAMMA X_FULLSCREEN VGAEMU_MEMSIZE VESAMODE X_LFB X_PM_INTERFACE X_MGRAB_KEY X_BACKGROUND_PAUSE
 	/* sdl */
@@ -313,7 +302,7 @@ enum {
 	/* disk */
 %token L_PARTITION WHOLEDISK THREEINCH THREEINCH_720 THREEINCH_2880 FIVEINCH FIVEINCH_360 READONLY LAYOUT
 %token SECTORS CYLINDERS TRACKS HEADS OFFSET HDIMAGE HDTYPE1 HDTYPE2 HDTYPE9 DISKCYL4096
-%token DEFAULT_DRIVES
+%token DEFAULT_DRIVES SKIP_DRIVES
 	/* ports/io */
 %token RDONLY WRONLY RDWR ORMASK ANDMASK RANGE FAST SLOW
 	/* Silly interrupts */
@@ -436,7 +425,8 @@ line:		CHARSET '{' charset_flags '}' {}
 		    { if ($2[0]) fprintf(stderr,"CONF aborted with: %s\n", $2);
 			exit(99);
 		    }
-		| WARN strarglist	{ c_printf("CONF: %s\n", $2); free($2); }
+		| ERROR strarglist { if ($2[0]) fprintf(stderr, "%s\n", $2); }
+		| WARN strarglist	{ warn("CONF: %s\n", $2); free($2); }
  		| EMUSYS string_expr
 		    {
 		    free(config.emusys); config.emusys = $2;
@@ -464,6 +454,14 @@ line:		CHARSET '{' charset_flags '}' {}
 		| LFN_SUPPORT bool
 		    {
 		    config.lfn = ($2!=0);
+		    }
+		| FINT_REVECT bool
+		    {
+		    config.force_revect = ($2 == -2 ? 1 : $2);
+		    }
+		| SET_INT_HOOKS bool
+		    {
+		    config.int_hooks = ($2 == -2 ? 1 : $2);
 		    }
 		| FFS_REDIR bool
 		    {
@@ -510,9 +508,7 @@ line:		CHARSET '{' charset_flags '}' {}
 			config.cpuemu = $2;
 			if (config.cpuemu > 4) {
 				config.cpuemu -= 2;
-#ifdef HOST_ARCH_X86
 				config.cpusim = 1;
-#endif
 			}
 			c_printf("CONF: %s CPUEMU set to %d for %d86\n",
 				CONFIG_CPUSIM ? "simulated" : "JIT",
@@ -559,7 +555,7 @@ line:		CHARSET '{' charset_flags '}' {}
 		        config.hdiskboot = $2[0] - 'a';
 		      } else {
 		        error("wrong value for $_bootdrive\n");
-		        config.hdiskboot = 2;
+		        config.hdiskboot = -1;
 		      }
 		      free($2);
 		    }
@@ -567,11 +563,27 @@ line:		CHARSET '{' charset_flags '}' {}
 		    {
 		      config.swap_bootdrv = ($2!=0);
 		    }
-		| DEFAULT_DRIVES bool
+		| DEFAULT_DRIVES int_expr
 		    {
-		      config.default_drives = ($2!=0);
-		      if (config.default_drives)
+		      c_printf("default_drives %i\n", $2);
+		      switch ($2) {
+		      case 0:
+		        set_drive_c();
+		        break;
+		      case 1:
 		        set_default_drives();
+		        break;
+		      default:
+			error("Path group %i not implemented\n", $2);
+			exit(1);
+		      }
+		    }
+		| SKIP_DRIVES int_expr
+		    {
+		      c_printf("skip %i drives from %i\n", $2, c_hdisks);
+		      config.drives_mask |= ((1 << $2) - 1) << (c_hdisks +
+			 skipped_disks + 2);
+		      skipped_disks += $2;
 		    }
 		| TIMER expression
 		    {
@@ -673,9 +685,17 @@ line:		CHARSET '{' charset_flags '}' {}
 		| IPXNETWORK int_bool	{ config.ipx_net = $2; }
 		| PKTDRIVER bool
 		    {
-		      if (config.vnet == VNET_TYPE_TAP || config.vnet == VNET_TYPE_VDE || $2 == 0 || is_in_allowed_classes(CL_NET)) {
+		      if ($2 == 0 || is_in_allowed_classes(CL_NET)) {
 			config.pktdrv = ($2!=0);
 			c_printf("CONF: Packet Driver %s.\n", 
+				($2) ? "enabled" : "disabled");
+		      }
+		    }
+		| NE2K bool
+		    {
+		      if ($2 == 0 || is_in_allowed_classes(CL_NET)) {
+			config.ne2k = ($2!=0);
+			c_printf("CONF: NE2000 %s.\n", 
 				($2) ? "enabled" : "disabled");
 		      }
 		    }
@@ -1071,7 +1091,6 @@ x_flag		: L_DISPLAY string_expr	{ free(config.X_display); config.X_display = $2;
 		| L_TITLE string_expr	{ free(config.X_title); config.X_title = $2; }
 		| X_TITLE_SHOW_APPNAME bool	{ config.X_title_show_appname = ($2!=0); }
 		| ICON_NAME string_expr	{ free(config.X_icon_name); config.X_icon_name = $2; }
-		| X_KEYCODE expression	{ config.X_keycode = $2; }
 		| X_BLINKRATE expression	{ config.X_blinkrate = $2; }
 		| X_SHARECMAP		{ config.X_sharecmap = 1; }
 		| X_MITSHM              { config.X_mitshm = 1; }
@@ -1289,60 +1308,60 @@ mouse_flag	: DEVICE string_expr	{ free(mptr->dev); mptr->dev = $2; }
 		| EMULATE3BUTTONS	{ mptr->emulate3buttons = TRUE; }
 		| BAUDRATE expression	{ mptr->baudRate = $2; }
 		| CLEARDTR
-		    { if (mptr->type == MOUSE_MOUSESYSTEMS)
+		    { if (mptr->dev_type == MOUSE_MOUSESYSTEMS)
 			 mptr->cleardtr = TRUE;
 		      else
 			 yyerror("option CLEARDTR is only valid for MicroSystems-mice");
 		    }
 		| MICROSOFT
 		  {
-		  mptr->type = MOUSE_MICROSOFT;
+		  mptr->dev_type = MOUSE_MICROSOFT;
 		  mptr->flags = CS7 | CREAD | CLOCAL | HUPCL;
 		  }
 		| MS3BUTTON
 		  {
-		  mptr->type = MOUSE_MS3BUTTON;
+		  mptr->dev_type = MOUSE_MS3BUTTON;
 		  mptr->flags = CS7 | CREAD | CLOCAL | HUPCL;
 		  }
 		| MOUSESYSTEMS
 		  {
-		  mptr->type = MOUSE_MOUSESYSTEMS;
+		  mptr->dev_type = MOUSE_MOUSESYSTEMS;
 		  mptr->flags = CS8 | CREAD | CLOCAL | HUPCL;
 /* is cstopb needed?  mptr->flags = CS8 | CSTOPB | CREAD | CLOCAL | HUPCL; */
 		  }
 		| MMSERIES
 		  {
-		  mptr->type = MOUSE_MMSERIES;
+		  mptr->dev_type = MOUSE_MMSERIES;
 		  mptr->flags = CS8 | PARENB | PARODD | CREAD | CLOCAL | HUPCL;
 		  }
 		| LOGITECH
 		  {
-		  mptr->type = MOUSE_LOGITECH;
+		  mptr->dev_type = MOUSE_LOGITECH;
 		  mptr->flags = CS8 | CSTOPB | CREAD | CLOCAL | HUPCL;
 		  }
 		| PS2
 		  {
-		  mptr->type = MOUSE_PS2;
+		  mptr->dev_type = MOUSE_PS2;
 		  mptr->flags = 0;
 		  }
 		| IMPS2
 		  {
-		  mptr->type = MOUSE_IMPS2;
+		  mptr->dev_type = MOUSE_IMPS2;
 		  mptr->flags = 0;
 		  }
 		| MOUSEMAN
 		  {
-		  mptr->type = MOUSE_MOUSEMAN;
+		  mptr->dev_type = MOUSE_MOUSEMAN;
 		  mptr->flags = CS7 | CREAD | CLOCAL | HUPCL;
 		  }
 		| HITACHI
 		  {
-		  mptr->type = MOUSE_HITACHI;
+		  mptr->dev_type = MOUSE_HITACHI;
 		  mptr->flags = CS8 | CREAD | CLOCAL | HUPCL;
 		  }
 		| BUSMOUSE
 		  {
-		  mptr->type = MOUSE_BUSMOUSE;
+		  mptr->dev_type = MOUSE_BUSMOUSE;
 		  mptr->flags = 0;
 		  }
 		| STRING
@@ -1445,7 +1464,8 @@ serial_flag	: DEVICE string_expr		{ free(sptr->dev); sptr->dev = $2; }
 		| COM expression	  { sptr->real_comport = $2; }
 		| BASE expression		{ sptr->base_port = $2; }
 		| IRQ expression		{ sptr->irq = $2; }
-		| MOUSE			{ sptr->mouse = 1; }
+		| MOUSE			{ sptr->mouse = 1;
+					  config.num_serial_mices++; }
 		| STRING
 		    { yyerror("unrecognized serial flag '%s'", $1); free($1); }
 		| error
@@ -1820,8 +1840,8 @@ charset_flags	: charset_flag
 		| charset_flags charset_flag
 		;
 
-charset_flag	: INTERNAL STRING { set_internal_charset ($2); free($2); }
-		| EXTERNAL STRING { set_external_charset ($2); free($2); }
+charset_flag	: INTERNAL STRING { set_internal_charset ($2); }
+		| EXTERNAL STRING { set_external_charset ($2); }
 		;
 
 %%
@@ -1862,6 +1882,7 @@ static void start_mouse(void)
   mptr = &config.mouse;
   mptr->fd = -1;
   mptr->com = -1;
+  mptr->com_num = -1;
   mptr->has3buttons = 1;	// drivers can disable this
 }
 
@@ -1870,7 +1891,11 @@ static void stop_mouse(void)
   char *p, *p1;
   if (mptr->dev && (p = strstr(mptr->dev, "com")) && strlen(p) > 3) {
     /* parse comX setting */
-    mptr->com = atoi(p + 3);
+    if (!isdigit(p[3]) || isdigit(p[4])) {
+      yyerror("wrong $_mouse_dev setting");
+      return;
+    }
+    mptr->com_num = atoi(p + 3);
     /* see if something else is specified and remove comX */
     if (p > mptr->dev) {
       p[-1] = 0;
@@ -1885,6 +1910,8 @@ static void stop_mouse(void)
     }
     c_printf("MOUSE: using COM%i\n", mptr->com);
   }
+
+  mptr->type = mptr->dev_type;
   c_printf("MOUSE: %s, type %x using internaldriver: %s, emulate3buttons: %s baudrate: %d\n", 
         mptr->dev && mptr->dev[0] ? mptr->dev : "no device specified",
         mptr->type, mptr->intdrv ? "yes" : "no", 
@@ -2041,7 +2068,7 @@ static int keyboard_statement_already = 0;
 
 static void start_keyboard(void)
 {
-  keyb_layout(KEYB_USER); /* NOTE: the default has changed, --Hans, 971204 */
+  config.layout = -1;
   config.console_keyb = 0;
   keyboard_statement_already = 1;
 }
@@ -2094,16 +2121,8 @@ static void start_floppy(void)
   dptr->header = 0;
 }
 
-static void start_disk(void)
+static void dp_init(struct disk *dptr)
 {
-  if (c_hdisks >= MAX_HDISKS) 
-    {
-    yyerror("There are too many hard disks defined");
-    dptr = &nulldisk;          /* Dummy-Entry to avoid core-dumps */
-    }
-  else
-    dptr = &hdisktab[c_hdisks];
-
   dptr->type    =  NODISK;
   dptr->sectors = -1;
   dptr->heads   = -1;
@@ -2116,7 +2135,25 @@ static void start_disk(void)
   dptr->header = 0;
 }
 
-static void start_vnet(char *mode) {
+static void start_disk(void)
+{
+  if (c_hdisks >= MAX_HDISKS)
+    {
+    yyerror("There are too many hard disks defined");
+    dptr = &nulldisk;          /* Dummy-Entry to avoid core-dumps */
+    }
+  else
+    dptr = &hdisktab[c_hdisks];
+
+  dp_init(dptr);
+}
+
+static void start_vnet(char *mode)
+{
+  if (strcmp(mode, "off") == 0) {
+    config.vnet = VNET_TYPE_NONE;
+    return;
+  }
   if (strcmp(mode, "") == 0) {
     config.vnet = VNET_TYPE_AUTO;
     return;
@@ -2229,13 +2266,14 @@ static void stop_disk(int token)
 
   if (token == L_FLOPPY) {
     c_printf(" floppy %c:\n", 'A'+c_fdisks);
+    disktab[c_fdisks].drive_num = c_fdisks;
     c_fdisks++;
-    config.fdisks = c_fdisks;
   }
   else {
     c_printf(" drive %c:\n", 'C'+c_hdisks);
+    hdisktab[c_hdisks].drive_num = (c_hdisks | 0x80);
+    hdisktab[c_hdisks].log_offs = skipped_disks;
     c_hdisks++;
-    config.hdisks = c_hdisks;
   }
 }
 
@@ -2244,6 +2282,7 @@ static void stop_disk(int token)
 void keyb_layout(int layout)
 {
   struct keytable_entry *kt = keytable_list;
+  config.layout = layout;
   if (layout == -1) {
     /* auto: do it later */
     config.keytable = NULL;
@@ -2415,11 +2454,14 @@ static void write_to_syslog(char *message)
 static void set_hdimage(struct disk *dptr, char *name)
 {
   char *l = strstr(name, ".lnk");
+
+  c_printf("Setting up hdimage %s\n", name);
   if (l && strlen(l) == 4) {
     const char *tmpl = "eval echo -n `cat %s`";
     char *cmd, path[1024], *rname;
     FILE *f;
     size_t ret;
+
     asprintf(&cmd, tmpl, name);
     free(name);
     f = popen(cmd, "r");
@@ -2429,139 +2471,78 @@ static void set_hdimage(struct disk *dptr, char *name)
     if (ret == 0)
       return;
     path[ret] = '\0';
+    c_printf("Link resolved to %s\n", path);
     rname = expand_path(path);
-    if (access(rname, R_OK) != 0)
+    if (access(rname, R_OK) != 0) {
+      warn("hdimage: %s does not exist\n", rname);
+      free(rname);
       return;
+    }
     dptr->dev_name = rname;
     dptr->type = DIR_TYPE;
+    c_printf("Set up as a directory\n");
     return;
   }
   dptr->type = IMAGE;
   dptr->dev_name = name;
+  c_printf("Set up as an image\n");
 }
 
-static int check_comcom(const char *dir)
+static int add_drive(const char *name)
 {
-  char *path;
-  int err;
-
-  path = assemble_path(dir, "command.com");
-  err = access(path, R_OK);
-  free(path);
-  if (err == 0)
-    return 1;
-  path = assemble_path(dir, "comcom32.exe");
-  err = access(path, R_OK);
-  free(path);
-  if (err == 0)
-    error("comcom32 found in %s but command.com symlink is missing\n", dir);
+  struct disk *dptr = &hdisktab[c_hdisks];
+  char *rname = expand_path(name);
+  if (access(rname, R_OK) != 0) {
+    free(rname);
+    return -1;
+  }
+  dp_init(dptr);
+  dptr->dev_name = rname;
+  dptr->type = DIR_TYPE;
+  dptr->drive_num = (c_hdisks | 0x80);
+  dptr->log_offs = skipped_disks;
+  c_printf("Added drive %i (%x): %s\n", c_hdisks, dptr->drive_num, name);
+  c_hdisks++;
   return 0;
 }
 
-static void comcom_hook(struct sys_dsc *sfiles, fatfs_t *fat)
+static void set_drive_c(void)
 {
-  char buf[1024];
-  char *comcom;
-  ssize_t res;
-  const char *dir = fatfs_get_host_dir(fat);
+  int err;
 
-  if (strcmp(dir, fddir_default) == 0) {
-    sfiles[CMD_IDX].flags |= FLG_COMCOM32;
-    return;
-  }
-  comcom = assemble_path(dir, "command.com");
-  res = readlink(comcom, buf, sizeof(buf));
-  free(comcom);
-  if (res == -1)
-    return;
-  if (strncmp(buf, fddir_default, strlen(fddir_default)) != 0)
-    return;
-  sfiles[CMD_IDX].flags |= FLG_COMCOM32;
-}
-
-static void set_freedos_dir(void)
-{
-  char *fddir;
-#ifdef USE_FDPP
-  if (load_plugin("fdpp"))
-    c_printf("fdpp: plugin loaded\n");
-  else
-    error("can't load fdpp\n");
-#endif
-  fddir = getenv("DOSEMU2_FREEDOS_DIR");
-  if (fddir)
-    fddir = strdup(fddir);
-  else
-    fddir = assemble_path(dosemu_lib_dir_path, FREEDOS_DIR);
-  if (access(fddir, R_OK | X_OK) == 0 && check_comcom(fddir)) {
-    fddir_default = fddir;
-    setenv("FREEDOS_DIR", fddir, 1);    // compat, unneeded
-  } else {
-    const char *comcom[] = {
-      "/usr/share/comcom32",
-      "/usr/local/share/comcom32",
-      NULL,
-    };
-    int i;
-    free(fddir);
-    for (i = 0; comcom[i]; i++) {
-      if (access(comcom[i], R_OK | X_OK) == 0 && check_comcom(comcom[i])) {
-        fddir_default = strdup(comcom[i]);
-        fatfs_set_sys_hook(comcom_hook);
-        break;
-      }
+  c_printf("Setting up drive C, %s\n", dosemu_drive_c_path);
+  if (!config.alt_drv_c && !exists_dir(dosemu_drive_c_path)) {
+    char *system_str;
+    c_printf("Creating default drive C\n");
+    err = asprintf(&system_str, "mkdir -p %s/tmp", dosemu_drive_c_path);
+    assert(err != -1);
+    err = system(system_str);
+    free(system_str);
+    if (err) {
+      error("unable to create %s\n", dosemu_drive_c_path);
+      return;
     }
   }
-  if (!fddir_default) {
-    error("Neither FreeDOS nor comcom32 installation found.\n"
-        "Use DOSEMU2_FREEDOS_DIR env var to specify alternative location.\n");
-  } else {
-    setenv("DOSEMU2_DRIVE_F", fddir_default, 1);
+  if (config.alt_drv_c && c_hdisks) {
+    error("wrong mapping of Group 0 to %c\n", 'C' + c_hdisks);
+    dosemu_drive_c_path = DRIVE_C_DEFAULT;
+    config.alt_drv_c = 0;
   }
-  if (!fddir_boot)
-    fddir_boot = assemble_path(dosemu_lib_dir_path, FDBOOT_DIR);
-  if (access(fddir_boot, R_OK | X_OK) == 0) {
-    setenv("FDBOOT_DIR", fddir_boot, 1);
-    setenv("DOSEMU2_DRIVE_E", fddir_boot, 1);
-  } else {
-    error("No system files found at %s\n", fddir_boot);
-    free(fddir_boot);
-    fddir_boot = NULL;
-  }
-}
-
-static void move_dosemu_lib_dir(void)
-{
-  char *old_cmd_path;
-
-  setenv("DOSEMU2_DRIVE_C", dosemu_drive_c_path, 1);
-  setenv("DOSEMU_LIB_DIR", dosemu_lib_dir_path, 1);
-  set_freedos_dir();
-  commands_path = assemble_path(dosemu_lib_dir_path, CMDS_SUFF);
-  if (access(commands_path, R_OK | X_OK) == 0) {
-    setenv("DOSEMU2_DRIVE_D", commands_path, 1);
-  } else {
-    error("dosemu2 commands not found at %s\n", commands_path);
-    free(commands_path);
-    commands_path = NULL;
-  }
-  old_cmd_path = assemble_path(dosemu_lib_dir_path, "dosemu2-cmds-0.1");
-  if (access(old_cmd_path, R_OK | X_OK) == 0)
-    setenv("DOSEMU_COMMANDS_DIR", old_cmd_path, 1);
-  else if (commands_path)
-    setenv("DOSEMU_COMMANDS_DIR", commands_path, 1);
-  free(old_cmd_path);
-
-  if (keymap_load_base_path != keymaploadbase_default)
-    free(keymap_load_base_path);
-  keymap_load_base_path = assemble_path(dosemu_lib_dir_path, "");
+  config.drive_c_num = c_hdisks | 0x80;
+  err = add_drive(dosemu_drive_c_path);
+  assert(!err);
 }
 
 static void set_default_drives(void)
 {
-  char *ddrives = assemble_path(dosemu_image_dir_path, DOSEMU_DRIVES_DIR "/*");
-  setenv("DOSEMU_DEFAULT_DRIVES", ddrives, 1);
-  free(ddrives);
+#define AD(p) \
+    if (p) \
+      add_drive(p)
+  c_printf("Setting up default drives from %c\n", 'C' + c_hdisks);
+  AD(commands_path);
+  AD(fddir_boot);
+  AD(comcom_dir);
+  AD(fddir_default);
 }
 
 static FILE *open_dosemu_users(void)
@@ -2649,7 +2630,6 @@ parse_dosemu_users(void)
   /* we check for some vital global settings
    * which we need before proceeding
    */
-  move_dosemu_lib_dir();
 
   fp = open_dosemu_users();
   if (fp) while (fgets(buf, PBUFLEN, fp) != NULL) {
@@ -2669,7 +2649,6 @@ parse_dosemu_users(void)
           ustr = strdup(ustr);
           replace_string(CFG_STORE, dosemu_lib_dir_path, ustr);
           dosemu_lib_dir_path = ustr;
-          move_dosemu_lib_dir();
         }
       }
       if (!strcmp(ustr, "default_hdimage_dir")) {
@@ -3384,55 +3363,3 @@ void dump_keytable(FILE *f, struct keytable_entry *kt)
     dump_keytable_part(f, kt->ctrl_alt_map, kt->sizemap);
     fprintf(f, "}\n\n\n");
 }
-
-
-
-	/* charset */
-static struct char_set *get_charset(char *name)
-{
-	struct char_set *charset;
-
-	charset = lookup_charset(name);
-	if (!charset) {
-		yyerror("Can't find charset %s", name);
-	}
-	return charset;
-
-}
-
-static void set_external_charset(char *charset_name)
-{
-	struct char_set *charset;
-	charset = get_charset(charset_name);
-	charset = get_terminal_charset(charset);
-	if (charset) {
-		if (!trconfig.output_charset) {
-			trconfig.output_charset = charset;
-		}
-		if (!trconfig.keyb_charset) {
-			trconfig.keyb_charset = charset;
-		}
-	}
-	return;
-}
-
-static void set_internal_charset(char *charset_name)
-{
-	struct char_set *charset_video, *charset_config;
-	charset_video = get_charset(charset_name);
-	if (!is_display_charset(charset_video)) {
-		yyerror("%s not suitable as an internal charset", charset_name);
-	}
-	charset_config = get_terminal_charset(charset_video);
-	if (charset_video && !trconfig.video_mem_charset) {
-		trconfig.video_mem_charset = charset_video;
-	}
-	if (charset_config && !trconfig.keyb_config_charset) {
-		trconfig.keyb_config_charset = charset_config;
-	}
-	if (charset_config && !trconfig.dos_charset) {
-		trconfig.dos_charset = charset_config;
-	}
-	return;
-}
-

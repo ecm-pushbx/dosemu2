@@ -28,7 +28,7 @@ static char *envptr(int *size, int parent_p)
     unsigned mcbseg;
     struct MCB *mcb;
 
-    parent_psp = (struct PSP *)SEG2LINEAR(parent_p);
+    parent_psp = (struct PSP *)SEG2UNIX(parent_p);
     if (parent_psp->envir_frame == 0) {
         error("no env pointer in PSP\n");
         return NULL;
@@ -105,12 +105,7 @@ static int com_msetenv(const char *variable, const char *value, int parent_p)
     return(-1);
 }
 
-
-/*
-   msetenv - place an environment variable in command.com's copy of
-             the envrionment.
-*/
-
+/* set to parent env */
 int msetenv(const char *var, const char *value)
 {
     return com_msetenv(var, value, com_parent_psp_seg());
@@ -136,7 +131,7 @@ int mresize_env(int size_plus)
         error("cannot realloc env to %i bytes\n", size + size_plus);
         return -1;
     }
-    memcpy(SEG2LINEAR(new_env), env, size);
+    memcpy(SEG2UNIX(new_env), env, size);
     /* DOS resize (0x4a) can't move :( */
     if (psp->envir_frame)
         err = com_dosfreemem(psp->envir_frame);
@@ -167,17 +162,8 @@ static char *_mgetenv(const char *variable, char *env, int size)
     return ret;
 }
 
+/* read from current env (not parent) */
 char *mgetenv(const char *variable)
-{
-    int size;
-    char *env = envptr(&size, com_parent_psp_seg());
-
-    if (!env)
-        return NULL;
-    return _mgetenv(variable, env, size);
-}
-
-char *mgetenv_child(const char *variable)
 {
     int size;
     char *env = envptr(&size, com_psp_seg());

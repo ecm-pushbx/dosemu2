@@ -63,14 +63,22 @@
 #define DOS_HELPER_XMS_HELPER       0x23
 #define DOS_HELPER_EMUFS_HELPER     0x24
 #define DOS_SUBHELPER_EMUFS_REDIRECT   0
+#define DOS_SUBHELPER_EMUFS_IOCTL      1
+
+#define EMUFS_IOCTL_GET_ENTRY          0
+#define EMUFS_HELPER_REDIRECT          1
 
 #define DOS_HELPER_GARROT_HELPER    0x28
 
 #define DOS_HELPER_SERIAL_HELPER    0x29
-#define DOS_SUBHELPER_SERIAL_TSR_CHECK 0
+#define DOS_SUBHELPER_SERIAL_FOSSIL_CHECK 0
 #define DOS_SUBHELPER_SERIAL_TSR_INSTALL 1
+#define DOS_SUBHELPER_SERIAL_FOSSIL_INIT 2
 #define DOS_ERROR_SERIAL_ALREADY_INSTALLED 1
 #define DOS_ERROR_SERIAL_CONFIG_DISABLED 2
+#define DOS_ERROR_SERIAL_TSR_INVALID 3
+#define DOS_ERROR_SERIAL_FOSSIL_VERSION 4
+#define DOS_VERSION_SERIAL_FOSSIL 1
 
 
 #define DOS_HELPER_BOOTDISK         0x30  /* OLD, removed functionality */
@@ -138,6 +146,7 @@
 
 #ifndef __ASSEMBLER__
 extern int commands_plugin_inte6(void);
+extern int commands_plugin_inte6_done(void);
 extern int commands_plugin_inte6_set_retcode(void);
 extern void commands_plugin_inte6_reset(void);
 

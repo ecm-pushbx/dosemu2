@@ -14,6 +14,9 @@ typedef struct dpmi_pm_block_stuct {
   dosaddr_t base;
   u_short  *attrs;
   int linear;
+  unsigned int shmsize;
+  char *shmname;
+  char *rshmname;
 } dpmi_pm_block;
 
 typedef struct dpmi_pm_block_root_struc {
@@ -23,6 +26,9 @@ typedef struct dpmi_pm_block_root_struc {
 dpmi_pm_block *lookup_pm_block(dpmi_pm_block_root *root, unsigned long h);
 dpmi_pm_block *lookup_pm_block_by_addr(dpmi_pm_block_root *root,
 	dosaddr_t addr);
+dpmi_pm_block *lookup_pm_block_by_shmname(dpmi_pm_block_root *root,
+	const char *shmname);
+int count_shm_blocks(dpmi_pm_block_root *root, const char *sname);
 int dpmi_alloc_pool(void);
 void dpmi_free_pool(void);
 dpmi_pm_block *DPMI_malloc(dpmi_pm_block_root *root, unsigned int size);
@@ -30,9 +36,15 @@ dpmi_pm_block *DPMI_mallocLinear(dpmi_pm_block_root *root, unsigned int base, un
 int DPMI_free(dpmi_pm_block_root *root, unsigned int handle);
 dpmi_pm_block *DPMI_realloc(dpmi_pm_block_root *root, unsigned int handle, unsigned int newsize);
 dpmi_pm_block *DPMI_reallocLinear(dpmi_pm_block_root *root, unsigned long handle, unsigned long newsize, int committed);
+dpmi_pm_block *DPMI_mallocShared(dpmi_pm_block_root *root,
+        char *name, unsigned int size, unsigned int shmsize, int flags);
+int DPMI_freeShared(dpmi_pm_block_root *root, uint32_t handle, int unlnk);
 void DPMI_freeAll(dpmi_pm_block_root *root);
 int DPMI_MapConventionalMemory(dpmi_pm_block_root *root, unsigned long handle,
   unsigned long offset, unsigned long low_addr, unsigned long cnt);
+dpmi_pm_block * DPMI_mapHWRam(dpmi_pm_block_root *root,
+  dosaddr_t base, unsigned int size);
+int DPMI_unmapHWRam(dpmi_pm_block_root *root, dosaddr_t vbase);
 int DPMI_SetPageAttributes(dpmi_pm_block_root *root, unsigned long handle, int offs, u_short attrs[], int count);
 int DPMI_GetPageAttributes(dpmi_pm_block_root *root, unsigned long handle, int offs, u_short attrs[], int count);
 int dpmi_lin_mem_rsv(void);

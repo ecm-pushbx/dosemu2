@@ -21,7 +21,6 @@ Andrew.Tridgell@anu.edu.au 30th March 1993
 #ifndef MAX_DRIVE
 #define MAX_DRIVE (PRINTER_BASE_DRIVE + MAX_PRINTER)
 #endif
-#define DRIVE_Z 32
 
 #define USE_DF_AND_AFS_STUFF
 
@@ -49,7 +48,7 @@ typedef struct vm86_regs state_t;
 #define HIGH(x)		MASK8((unsigned long)(x) >> 8)
 #define LOW(x)		MASK8((unsigned long)(x))
 #undef WORD
-#define WORD(x)		(uint16_t)(x)
+#define WORD(x)		(unsigned)(uint16_t)(x)
 #define SETHIGH(x,y) 	(*(x) = (*(x) & ~0xff00) | ((MASK8(y))<<8))
 #define SETLOW(x,y) 	(*(x) = (*(x) & ~0xff) | (MASK8(y)))
 #define SETWORD(x,y)	(*(x) = (*(x) & ~0xffff) | (MASK16(y)))
@@ -232,7 +231,6 @@ typedef struct vm86_regs state_t;
 #define FILE_ALREADY_EXISTS	0x50
 
 #define DUPLICATE_REDIR		0x55
-#define FUNCTION_NOT_SUPPORTED	0x59
 
 #define CDS_DEFAULT_ROOT_LEN	2
 
@@ -287,8 +285,12 @@ struct drive_info
 {
   char *root;
   int root_len;
-  int read_only;
+  int options;
+  #define read_only(x) (x.options & 1)
+  #define cdrom(x) ((x.options >> 1) & 7)
+  uint16_t user_param;
   char curpath[67 + 1];
+  int saved_cds_flags;
 };
 extern struct drive_info drives[];
 
@@ -346,9 +348,13 @@ extern void get_volume_label(char *fname, char *fext, char *lfn, int drive);
 extern int dos_rename_lfn(const char *filename1, const char *filename2, int drive);
 extern int dos_mkdir(const char *filename, int drive, int lfn);
 extern int dos_rmdir(const char *filename, int drive, int lfn);
-extern char *sft_to_filename(unsigned char *sft, int *fd);
 
 extern void register_cdrom(int drive, int device);
 extern void unregister_cdrom(int drive);
 extern int get_volume_label_cdrom(int drive, char *name);
 extern int get_drive_from_path(char *path, int *drive);
+
+/* returns drive number and any bits that are impossible for drive.
+ * Should be checked against MAX_DRIVE to make sure it is actually
+ * a drive, i.e. no impossible-for-drive bits are set. */
+#define SFT_DRIVE(sft) ((sft_device_info(sft) & 0x88bf) ^ 0x8800)

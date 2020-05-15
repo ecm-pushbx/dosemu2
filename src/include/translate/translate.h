@@ -155,7 +155,13 @@ size_t character_count(const struct char_set_state *in_state, const char *str,
 size_t charset_to_unicode_string(
 	struct char_set_state *state,
 	t_unicode *dst,
-	const char **src, size_t src_len);
+	const char **src, size_t src_len,
+	size_t dst_len);
+size_t unicode_to_charset_string(
+	struct char_set_state *state,
+	char *dst,
+	const t_unicode **src,
+	size_t src_len, size_t dst_len);
 
 /* convert a Unicode string to a possibly multibyte string;
    result is malloc'ed so needs to be free'ed.
@@ -172,7 +178,7 @@ extern long int unicode_to_long (t_unicode *ptr,
 
 struct translate_config_t {
        struct char_set *video_mem_charset;  /* character set emulated dos display is in (single byte) */
-       struct char_set *keyb_config_charset;  /* character set keypresses are translated into (single byte)*/
+#define keyb_config_charset dos_charset  /* character set keypresses are translated into (single byte)*/
        struct char_set *output_charset;  /* character set users terminal is in (single byte) */
        struct char_set *keyb_charset;  /* character set keyboard input comes in */
        struct char_set *dos_charset;   /* character set used for DOS filesystem */

@@ -1,0 +1,13 @@
+rem config.sys for DOSEMU2 + FDPP
+SWITCHES=#0
+CHAIN=@userhook.sys
+DOS=UMB,HIGH
+dosdata=umb
+lastdrive=Z
+int0divz=off
+device=dosemu\umb.sys
+devicehigh=dosemu\ems.sys
+devicehigh=dosemu\emufs.sys
+devicehigh=dosemu\cdrom.sys
+install=dosemu\emufs.com
+shellhigh=command.com /e:384 /k %FDPP_AUTOEXEC%

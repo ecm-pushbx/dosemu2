@@ -51,7 +51,7 @@ static int str_checksum(char *s)
   while (*s)
     {
       c = *s;
-      res ^= (c << (i % 15)) ^ (c >> (15-(i%15)));
+      res ^= ((unsigned)c << (i % 15)) ^ ((unsigned)c >> (15-(i%15)));
       s++; i++;
     }
   return(res);
@@ -61,11 +61,11 @@ static int str_checksum(char *s)
 check if a name is a special msdos reserved name:
 the name is either a full Unix name or an 8 character candidate
 ****************************************************************************/
-unsigned int is_dos_device(const char *fname)
+dosaddr_t is_dos_device(const char *fname)
 {
   char *p;
-  unsigned int dev;
-  unsigned int devfar;
+  dosaddr_t dev;
+  dosaddr_t devfar;
   int i;
   int cnt;
 
@@ -487,7 +487,7 @@ BOOL name_ufs_to_dos(char *dest, const char *src)
     symbol = *wdest++;
     if (symbol > 0xffff)
       symbol = '_';
-    *dest = unicode_to_dos_table[symbol];
+    *dest = unicode_to_dos_table(symbol);
     if (!VALID_DOS_PCHAR(dest) && strchr(" +,;=[]",*dest)==0)
       retval = 0;
     dest++;

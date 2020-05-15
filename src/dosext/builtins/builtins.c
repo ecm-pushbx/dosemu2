@@ -55,7 +55,7 @@ struct {
     struct lowstring *cmdl;
     struct param4a *pa4;
     uint16_t es;
-    uint8_t retcode;
+    uint16_t retcode;
     int allocated;
     run_dos_cb run_dos;
     get_psp_cb get_psp;
@@ -64,12 +64,11 @@ struct {
 
 static char *com_strdup(const char *s);
 static void com_strfree(char *s);
-static void inte6_done(void *arg);
 
 char *com_getenv(const char *keyword)
 {
 	struct PSP  *psp = COM_PSP_ADDR;
-	char *env = SEG2LINEAR(psp->envir_frame);
+	char *env = SEG2UNIX(psp->envir_frame);
 	char key[128];
 	int len;
 
@@ -120,7 +119,6 @@ static int load_and_run_DOS_program(const char *command, const char *cmdline)
 	LWORD(edx) = DOSEMU_LMHEAP_OFFS_OF(BMEM(cmd));
 
 	fake_call_to(BIOSSEG, GET_RETCODE_HELPER);
-	coopth_add_post_handler(inte6_done, NULL);
 	LWORD(eax) = 0x4b00;
 	real_run_int(0x21);
 
@@ -134,6 +132,7 @@ static int do_system(const char *command)
 
 	if (!program) program = "C:\\COMMAND.COM";
 	snprintf(cmdline, sizeof(cmdline), "/E:2048 /C %s", command);
+	coopth_leave();
 	return load_and_run_DOS_program(program, cmdline);
 }
 
@@ -299,6 +298,7 @@ int com_dossetdrive(int drive)
 
 int com_dossetcurrentdir(char *path)
 {
+        int ret = 0;
         /*struct com_starter_seg  *ctcb = owntcb->params;*/
         char *s = com_strdup(path);
 
@@ -310,12 +310,53 @@ int com_dossetcurrentdir(char *path)
         LWORD(edx) = DOSEMU_LMHEAP_OFFS_OF(s);
         call_msdos();    /* call MSDOS */
         com_strfree(s);
-        if (LWORD(eflags) & CF) {
-                post_msdos();
-                return -1;
-        }
+        if (LWORD(eflags) & CF)
+                ret = -1;
         post_msdos();
-        return 0;
+        return ret;
+}
+
+static int is_valid_drive(int drv)
+{
+  char *fname, *fcb;
+  int ret;
+
+  pre_msdos();
+
+  /* Parse filename into FCB (physical, formatted or not, and network) */
+  fname = lowmem_heap_alloc(16);
+  snprintf(fname, 16, "%c:FILENAME.EXT", 'A' - 1 + drv);
+  fcb = lowmem_heap_alloc(0x25);
+  memset(fcb, 0, 0x25);
+
+  HI(ax) = 0x29;	// Parse Filename
+  LO(ax) = 0x00;	// Standard parsing
+  SREG(ds) = DOSEMU_LMHEAP_SEG;
+  LWORD(esi) = DOSEMU_LMHEAP_OFFS_OF(fname);
+  SREG(es) = DOSEMU_LMHEAP_SEG;
+  LWORD(edi) = DOSEMU_LMHEAP_OFFS_OF(fcb);
+  call_msdos();
+
+  lowmem_heap_free(fcb);
+  lowmem_heap_free(fname);
+
+  ret = (LO(ax) != 0xff); // 0xff == invalid drive
+
+  post_msdos();
+  return ret;
+}
+
+int com_FindFreeDrive(void)
+{
+  int drive;
+
+  for (drive = 2; drive < 26; drive++) {
+    if (is_valid_drive(drive + 1))  // 0 = default, 1 = A etc
+      continue;
+    return drive;
+  }
+
+  return -1;
 }
 
 /********************************************
@@ -397,17 +438,18 @@ uint16_t com_CancelRedirection(char *deviceStr)
  *    (ex. 'TIM\TOOLS')
  *  deviceType indicates the type of device which was redirected
  *    3 = printer, 4 = disk
- *  deviceParameter has my rights to this resource
+ *  deviceUserData has the magic word passed during creation
+ *  deviceOptions has Dosemu specifics (disabled, cdrom unit, read only)
  * NOTES:
  *
  ********************************************/
 uint16_t com_GetRedirection(uint16_t redirIndex, char *deviceStr,
-                            char *slashedResourceStr,
-                            uint8_t *deviceType, uint16_t *deviceParameter)
+                            char *resourceStr, uint8_t *deviceType,
+                            uint16_t *deviceUserData, uint16_t *deviceOptions)
 {
   char *dStr = lowmem_heap_alloc(16);
   char *sStr = lowmem_heap_alloc(128);
-  uint16_t ret, deviceParameterTemp;
+  uint16_t ret, deviceUserDataTemp, deviceOptionsTemp;
   uint8_t deviceTypeTemp;
 
   pre_msdos();
@@ -417,6 +459,7 @@ uint16_t com_GetRedirection(uint16_t redirIndex, char *deviceStr,
   SREG(es) = DOSEMU_LMHEAP_SEG;
   LWORD(edi) = DOSEMU_LMHEAP_OFFS_OF(sStr);
 
+  LWORD(ecx) = REDIR_CLIENT_SIGNATURE;
   LWORD(ebx) = redirIndex;
   LWORD(eax) = DOS_GET_REDIRECTION;
 
@@ -425,16 +468,25 @@ uint16_t com_GetRedirection(uint16_t redirIndex, char *deviceStr,
   ret = (LWORD(eflags) & CF) ? LWORD(eax) : CC_SUCCESS;
 
   deviceTypeTemp = LO(bx);
-  deviceParameterTemp = LWORD(ecx);
+  deviceUserDataTemp = LWORD(ecx);
+  deviceOptionsTemp = LWORD(edx);
 
   post_msdos();
 
   if (ret == CC_SUCCESS) {
-    /* copy back unslashed portion of resource string */
-    strcpy(slashedResourceStr, sStr);
+    strcpy(resourceStr, sStr);
     strcpy(deviceStr, dStr);
-    *deviceType = deviceTypeTemp;
-    *deviceParameter = deviceParameterTemp;
+
+    if (deviceType)
+      *deviceType = deviceTypeTemp;
+    if (deviceUserData)
+      *deviceUserData = deviceUserDataTemp;
+    if (deviceOptions) {
+      if (strncmp(sStr, LINUX_RESOURCE, strlen(LINUX_RESOURCE)) == 0)
+        *deviceOptions = deviceOptionsTemp;
+      else
+        *deviceOptions = 0;
+    }
   }
 
   lowmem_heap_free(sStr);
@@ -520,7 +572,7 @@ void register_com_program(const char *name, com_program_type *program)
 
 static char *com_getarg0(void)
 {
-	char *env = SEG2LINEAR(((struct PSP *)SEG2LINEAR(COM_PSP_SEG))->envir_frame);
+	char *env = SEG2UNIX(((struct PSP *)SEG2UNIX(COM_PSP_SEG))->envir_frame);
 	return memchr(env, 1, 0x10000) + 2;
 }
 
@@ -611,8 +663,8 @@ int commands_plugin_inte6(void)
 	    return 0;
 	}
 
-	psp = SEG2LINEAR(COM_PSP_SEG);
-	mcb = SEG2LINEAR(COM_PSP_SEG - 1);
+	psp = SEG2UNIX(COM_PSP_SEG);
+	mcb = SEG2UNIX(COM_PSP_SEG - 1);
 	arg0 = com_getarg0();
 	/* see if we have valid asciiz name in MCB */
 	err = 0;
@@ -635,7 +687,7 @@ int commands_plugin_inte6(void)
 		if (p)
 			*p = '\0';
 	}
-	assert(psp->cmdline_len < sizeof(cmdbuf)); // len uint8_t, cant assert
+//	assert(psp->cmdline_len < sizeof(cmdbuf)); // len uint8_t, cant assert
 	memcpy(cmdbuf, psp->cmdline, psp->cmdline_len);
 	cmdbuf[psp->cmdline_len] = '\0';
 	if (pool_used >= MAX_NESTING) {
@@ -653,19 +705,20 @@ int commands_plugin_inte6(void)
 	return err;
 }
 
-static void inte6_done(void *arg)
+int commands_plugin_inte6_done(void)
 {
 	if (!pool_used)
-	    return;
+	    return 0;
 
 	SREG(es) = BMEM(es);
-	LO(ax) = BMEM(retcode);
+	LWORD(ebx) = BMEM(retcode);
 	if (BMEM(allocated)) {
 	    com_strfree(BMEM(cmd));
 	    lowmem_heap_free((void *)BMEM(pa4));
 	    lowmem_heap_free((void *)BMEM(cmdl));
 	}
 	pool_used--;
+	return 1;
 }
 
 int commands_plugin_inte6_set_retcode(void)

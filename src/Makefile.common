@@ -1,9 +1,12 @@
+# if building in subdir, SUBDIR is not passed from outside, so evaluate
+SUBDIR ?= $(patsubst /%,%,$(subst $(abs_top_builddir)/src,,$(CURDIR)))
+LIBNAME := $(subst /,_,$(SUBDIR))
+
 vpath %.c $(srcdir)
 vpath %.h $(srcdir)
 vpath %.S $(srcdir)
 vpath %.s $(srcdir)
 vpath %.sgml $(srcdir)
-LIBNAME := $(subst /,_,$(SUBDIR))
 
 ifndef OBJS
 OBJS=$(CFILES:.c=.o) $(SFILES:.S=.o)
@@ -12,7 +15,7 @@ endif
 GENOBJS = $(GENSRC:.c=.o)
 
 ifndef DEPENDS
-DEPENDS=$(OBJS:.o=.d)
+DEPENDS=$(OBJS:.o=.d) $(XSFILES:.s=.d)
 endif
 
 GENERATED = $(top_builddir)/src/include/version.hh \
@@ -20,13 +23,18 @@ GENERATED = $(top_builddir)/src/include/version.hh \
     $(top_builddir)/src/base/bios/x86/bios_offsets.hh \
     $(top_builddir)/src/base/bios/x86/bios_data.xxd
 
-LIB:=$(top_builddir)/src/lib/lib$(LIBNAME).a
+ifneq ($(GENHDRS),)
+GENERATED += $(GENHDRS)
+ALL_CPPFLAGS += -iquote .
+endif
+
+LIB:=$(BINPATH)/lib/lib$(LIBNAME).a
 
 AR=ar
 
-lib:	$(LIB)
+lib: $(LIB)
 
-$(BINPATH) $(BINPATH)/bin $(BINPATH)/commands:
+$(BINPATH) $(BINPATH)/bin $(BINPATH)/commands $(BINPATH)/lib:
 	mkdir -p $@
 
 $(top_builddir)/commands: | $(BINPATH)/commands
@@ -37,10 +45,11 @@ $(top_builddir)/bin: | $(BINPATH)/bin
 	rm -f $@
 	ln -sf $(THISVERSION)/bin $@
 
-$(top_builddir)/src/lib:
-	mkdir -p $@
+$(top_builddir)/lib: | $(BINPATH)/lib
+	rm -f $@
+	ln -sf $(THISVERSION)/lib $@
 
-GIT_REV := $(shell $(REALTOPDIR)/git-rev.sh)
+GIT_REV := $(shell $(REALTOPDIR)/git-rev.sh $(top_builddir))
 .LOW_RESOLUTION_TIME: $(GIT_REV)
 $(top_builddir)/src/include/version.hh: $(top_builddir)/Makefile.conf $(REALTOPDIR)/VERSION $(GIT_REV)
 	echo "Updating version.h"; \
@@ -60,7 +69,7 @@ $(top_builddir)/src/base/bios/x86/bios_offsets.hh \
     $(top_builddir)/src/include/version.hh
 	$(MAKE) -C $(top_builddir)/src/base/bios/x86 SUBDIR=base/bios/x86 $(notdir $@)
 
-$(LIB): $(OBJS) $(GENOBJS) | $(top_builddir)/src/lib
+$(LIB): $(OBJS) $(GENOBJS) | $(BINPATH)/lib
 	rm -f $@
 	$(AR) cr $@ $^
 	$(RANLIB) $@
@@ -68,25 +77,25 @@ $(LIB): $(OBJS) $(GENOBJS) | $(top_builddir)/src/lib
 .PHONY:	clean realclean lib echo all install default
 
 clean::
-	-rm -f $(OBJS) $(LIB) $(GENSRC) $(DEPENDS) configure *~
+	-rm -f $(OBJS) $(LIB) $(GENSRC) $(DEPENDS) $(GENHDRS) configure *~
 
-realclean::	clean
+realclean:: clean
 	rm -f $(DEPENDS)
 	rm -rf autom4te*.cache
 	rm -f Makefile.conf config.log config.status configure aclocal.m4
 	rm -rf plugin/include
 
-$(OBJS): $(GENERATED) $(GENSRC)
+$(OBJS): $(GENERATED)
 $(GENOBJS): $(GENSRC)
 
 %.o: %.c
 	$(CC) -c $(ALL_CPPFLAGS) $(ALL_CFLAGS) -o $@ $<
 
 $(XSFILES:.s=.o): %.o: %.s $(top_builddir)/src/include/version.hh
-	$(CPP) $(ALL_CPPFLAGS) -x assembler-with-cpp $< | $(AS) $(ASFLAGS) -o $@
+	$(CPP) $(ALL_CPPFLAGS) -x assembler-with-cpp $< | $(AS) --32 -o $@
 
 %.o: %.S $(top_builddir)/src/include/version.hh
-	$(CC) -c $(ALL_CPPFLAGS) -x assembler-with-cpp -o $@ $<
+	$(CPP) $(ALL_CPPFLAGS) -x assembler-with-cpp $< | $(AS) $(ASFLAGS) -o $@
 
 ifndef CLEANING
 ifneq "$(wildcard *.d)" ""

@@ -5,13 +5,14 @@
 #
 
 top_builddir=../../..
-include $(top_builddir)/Makefile.conf
--include Makefile.conf
+include ../plugins.mak
+$(eval $(makefile_conf))
 
 ALL_CFLAGS+=$(DL_CFLAGS)
 CFILES=svgalib.c
 ifdef USE_DL_PLUGINS
 all: $(BINPATH)/bin/libplugin_svgalib.so
+ALL_CFLAGS += -fPIC
 endif
 
 include $(REALTOPDIR)/src/Makefile.common

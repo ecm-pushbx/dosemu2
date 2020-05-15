@@ -191,8 +191,9 @@ with -E or -K switches.
 .br
 Note: only works in dumb terminal mode currently.
 .TP
-.I -k
-use RAW console Keyboard (must be at the console)
+.I -k[str]
+Set keyboard input type. Plain -k or -kr sets RAW console Keyboard
+(must be at the console). Use -kt for TTY and -ks for STDIO inputs.
 .TP
 .I -F
 Parse this config-script instead of the built-in global.conf file
@@ -325,6 +326,9 @@ use direct console video with VGA graphics and use the native graphics
 card's BIOS (must be at the console, requires special privileges, and
 .I -s
 ).
+.TP
+.I -Y
+trace DOS boot ([Y/N] prompt for config.sys lines)
 .TP
 .I -w
 toggle windowed/fullscreen mode in X

@@ -28,14 +28,15 @@
 #include "dos2linux.h"
 #include "dpmi.h"
 #include "msdoshlp.h"
+#include "msdos_priv.h"
 #include "callbacks.h"
 
-static uint8_t *io_buffer;
+static dosaddr_t io_buffer;
 static int io_buffer_size;
 static int io_error;
 static uint16_t io_error_code;
 
-void set_io_buffer(uint8_t *ptr, unsigned int size)
+void set_io_buffer(dosaddr_t ptr, unsigned int size)
 {
     io_buffer = ptr;
     io_buffer_size = size;
@@ -236,13 +237,16 @@ void xms_call(const sigcontext_t *scp,
 	(1 << eip_INDEX) | (1 << ss_INDEX) | (1 << esp_INDEX);
     D_printf("MSDOS: XMS call to 0x%x:0x%x\n",
 	     XMS_call->segment, XMS_call->offset);
+    msdos_pre_xms(scp, rmreg, &rmask);
     pm_to_rm_regs(scp, rmreg, ~rmask);
     do_call_to(XMS_call->segment, XMS_call->offset, rmreg, rmask);
 }
 
 void xms_ret(sigcontext_t *scp, const struct RealModeCallStructure *rmreg)
 {
-    rm_to_pm_regs(scp, rmreg, ~0);
+    int rmask = 0;
+    msdos_post_xms(scp, rmreg, &rmask);
+    rm_to_pm_regs(scp, rmreg, ~rmask);
     D_printf("MSDOS: XMS call return\n");
 }
 
@@ -259,7 +263,7 @@ static void rmcb_handler(sigcontext_t *scp,
 	    D_printf("MSDOS: read %x %x\n", offs, size);
 	    /* need to use copy function that takes VGA mem into account */
 	    if (offs + size <= io_buffer_size)
-		memcpy_2unix(io_buffer + offs, dos_ptr, size);
+		memcpy_dos2dos(io_buffer + offs, dos_ptr, size);
 	    else
 		error("MSDOS: bad read (%x %x %x)\n", offs, size,
 		      io_buffer_size);
@@ -273,7 +277,7 @@ static void rmcb_handler(sigcontext_t *scp,
 	    D_printf("MSDOS: write %x %x\n", offs, size);
 	    /* need to use copy function that takes VGA mem into account */
 	    if (offs + size <= io_buffer_size)
-		memcpy_2dos(dos_ptr, io_buffer + offs, size);
+		memcpy_dos2dos(dos_ptr, io_buffer + offs, size);
 	    else
 		error("MSDOS: bad write (%x %x %x)\n", offs, size,
 		      io_buffer_size);

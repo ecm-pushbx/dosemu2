@@ -339,6 +339,7 @@ exprtest		RETURN(EXPRTEST);
 feature			RETURN(FEATURE);
 abort			RETURN(ABORT);
 warn			RETURN(WARN);
+error			RETURN(ERROR);
 x			RETURN(L_X);
 sdl			RETURN(L_SDL);
 dosbanner		RETURN(DOSBANNER);
@@ -349,6 +350,7 @@ speaker			RETURN(SPEAKER);
 ipxsupport		RETURN(IPXSUPPORT);
 ipx_network		RETURN(IPXNETWORK);
 pktdriver		RETURN(PKTDRIVER);
+ne2k			RETURN(NE2K);
 debug			RETURN(DEBUG);
 mouse			RETURN(MOUSE);
 serial			RETURN(SERIAL);
@@ -386,6 +388,8 @@ printer			RETURN(PRINTER);
 emusys                  RETURN(EMUSYS);
 full_file_locks		RETURN(FULL_FILE_LOCKS);
 lfn_support		RETURN(LFN_SUPPORT);
+force_int_revect	RETURN(FINT_REVECT);
+set_int_hooks		RETURN(SET_INT_HOOKS);
 force_fs_redirect	RETURN(FFS_REDIR);
 ttylocks		RETURN(TTYLOCKS);
 sound_emu               RETURN(L_SOUND);
@@ -445,6 +449,7 @@ hdtype1			RETURN(HDTYPE1);
 hdtype2			RETURN(HDTYPE2);
 hdtype9			RETURN(HDTYPE9);
 default_drives		RETURN(DEFAULT_DRIVES);
+skip_drives		RETURN(SKIP_DRIVES);
 
 	/* keyboard */
 ctrl			RETURN(CTRL_MAP);
@@ -605,7 +610,6 @@ display			RETURN(L_DISPLAY);
 title			RETURN(L_TITLE);
 title_show_appname      RETURN(X_TITLE_SHOW_APPNAME);
 icon_name		RETURN(ICON_NAME);
-keycode			RETURN(X_KEYCODE);
 blinkrate		RETURN(X_BLINKRATE);
 sharecmap		RETURN(X_SHARECMAP);
 mitshm                  RETURN(X_MITSHM);
@@ -896,12 +900,12 @@ OUR_YY_DECL
 {
 	int ret;
 
-	ret = real_yylex(yylval);
+	ret = real_yylex(&yylval);
 
         if (__loop_handling__ >0) {
 		/* we respawn yylex in a loop, while filling the cache files */
 		while (__loop_handling__ >0) {
-			ret = real_yylex(yylval);
+			ret = real_yylex(&yylval);
 			if (ret == YY_NULL) {
 				__loop_handling__ = 0;
 				close_cachefile_write(savebufwptr);
@@ -912,7 +916,7 @@ OUR_YY_DECL
 			}
 		}
 		/* and again, to get the first token again */
-		ret = real_yylex(yylval);
+		ret = real_yylex(&yylval);
 	}
 	return(ret);
 }

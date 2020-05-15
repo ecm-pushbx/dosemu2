@@ -106,6 +106,43 @@ int sb_dma_16bit(void)
     return 0;
 }
 
+int sb_dma_adpcm(void)
+{
+    if (!sb.dma_cmd)
+	error("SB: used inactive DMA (adpcm)\n");
+    switch (sb.dma_cmd) {
+    case 0x74:
+    case 0x75:
+    case 0x7d:
+	return 4;
+    case 0x76:
+    case 0x77:
+    case 0x7f:
+	return 3;
+    case 0x16:
+    case 0x17:
+    case 0x1f:
+	return 2;
+    }
+    return 0;
+}
+
+int sb_dma_adpcm_ref(void)
+{
+    if (!sb.dma_cmd)
+	error("SB: used inactive DMA (adpcm_ref)\n");
+    switch (sb.dma_cmd) {
+    case 0x75:
+    case 0x77:
+    case 0x17:
+    case 0x7d:
+    case 0x7f:
+    case 0x1f:
+	return 1;
+    }
+    return 0;
+}
+
 static int sb_dma_sb16mode(void)
 {
     if (!sb.dma_cmd)
@@ -556,9 +593,9 @@ static void sb_mixer_reset(void)
 
     sb.mixer_regs[0x3b] = 0;	/* -18 dB */
 
-    sb.mixer_regs[0x3c] = 0x1f;
-    sb.mixer_regs[0x3d] = 0x15;
-    sb.mixer_regs[0x3e] = 0x0b;
+    sb.mixer_regs[0x3c] = 0x1f;	/* line, cd, mic output - on */
+    sb.mixer_regs[0x3d] = 0x15;	/* line.L, cd.L, mic - on */
+    sb.mixer_regs[0x3e] = 0x0b;	/* line.R, cd.R, mic - on */
 
     sb.mixer_regs[0x3f] =
     sb.mixer_regs[0x40] =

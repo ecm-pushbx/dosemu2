@@ -57,6 +57,8 @@
 #include "port.h"
 #include "speaker.h"
 #include "utilities.h"
+#include "dos2linux.h"
+#include "timers.h"
 #include "vgaemu.h"
 #include "vgatext.h"
 
@@ -255,20 +257,15 @@ void tty_char_out(unsigned char ch, int s, int attr)
 /* i10_deb("tty_char_out: char 0x%02x, page %d, attr 0x%02x\n", ch, s, attr); */
 
   if (config.dumb_video) {
-    struct char_set_state dos_state;
     struct char_set_state term_state;
-    t_unicode uni;
+    t_unicode uni = dos_to_unicode_table[ch];
     unsigned char buff[MB_LEN_MAX + 1];
     int num, i;
 
     if (config.quiet)
       return;
 
-    init_charset_state(&dos_state, trconfig.dos_charset);
     init_charset_state(&term_state, trconfig.output_charset);
-    num = charset_to_unicode(&dos_state, &uni, &ch, 1);
-    if (num <= 0)
-      return;
     num = unicode_to_charset(&term_state, uni, buff, MB_LEN_MAX);
     if (num <= 0)
       return;
@@ -739,6 +736,8 @@ int int10(void) /* with dualmon */
     else Video->update_screen = Video_default->update_screen;
   }
 #endif
+
+  reset_idle(0);
 
   li= READ_BYTE(BIOS_ROWS_ON_SCREEN_MINUS_1) + 1;
   co= READ_WORD(BIOS_SCREEN_COLUMNS);
@@ -1433,7 +1432,7 @@ int int10(void) /* with dualmon */
       switch(LO(ax)) {
       case 0: {
 	unsigned size = 0;
-	i10_msg("save/restore: return state buffer size\n");
+	i10_msg("save/restore: return state buffer size, cl=%x\n", LO(cx));
 	if (LO(cx) & 1) {
 	  /* video hardware */
 	  size += 0x46;
@@ -1450,6 +1449,7 @@ int int10(void) /* with dualmon */
 	break;
       }
       case 1:
+	i10_msg("save/restore: save state, cl=%x\n", LO(cx));
 	if (LO(cx) & 1) {
 	  unsigned char buf[0x46];
 	  unsigned crtc, ind;
@@ -1513,11 +1513,12 @@ int int10(void) /* with dualmon */
 	  for(ind = 0; ind < 768; ind++)
 	    buf[0x3 + ind] = port_inb(DAC_DATA);
 	  buf[0x303] = port_inb(COLOR_SELECT);
-
 	  MEMCPY_2DOS(SEGOFF2LINEAR(SREG(es), base), buf, sizeof(buf));
+	  base += sizeof(buf);
 	}
 	break;
       case 2:
+	i10_msg("save/restore: restore state, cl=%x\n", LO(cx));
 	if (LO(cx) & 1) {
 	  unsigned char buf[0x46];
 	  unsigned crtc, ind;
@@ -1553,13 +1554,14 @@ int int10(void) /* with dualmon */
 	  memcpy(vga.latch, &buf[0x42], 4);
 	}
 	if (LO(cx) & 2) {
-	  MEMCPY_DOS2DOS(0x449, SEGOFF2LINEAR(_ES, _BX), 96);
+	  MEMCPY_DOS2DOS(0x449, SEGOFF2LINEAR(_ES, base), 96);
 	  base += 96;
 	}
 	if (LO(cx) & 4) {
 	  unsigned char buf[0x304];
 	  unsigned ind;
 	  MEMCPY_2UNIX(buf, SEGOFF2LINEAR(_ES, base), sizeof(buf));
+	  base += sizeof(buf);
 	  port_outb(DAC_PEL_MASK, buf[2]);
 	  port_outb(DAC_WRITE_INDEX, 0x00);
 	  for(ind = 0; ind < 768; ind++)

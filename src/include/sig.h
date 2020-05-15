@@ -28,6 +28,15 @@ static inline int dosemu_arch_prctl(int code, void *addr)
 		   : "memory", "cc", "r11", "cx");
   return _result;
 }
+#else
+#define ARCH_SET_GS 0
+#define ARCH_SET_FS 0
+#define ARCH_GET_FS 0
+#define ARCH_GET_GS 0
+static inline int dosemu_arch_prctl(int code, void *addr)
+{
+  return 0;
+}
 #endif
 
 #if defined(__linux__)
@@ -35,6 +44,11 @@ static inline int dosemu_arch_prctl(int code, void *addr)
 static inline int dosemu_sigaltstack(const stack_t *ss, stack_t *oss)
 {
   return syscall(SYS_sigaltstack, ss, oss);
+}
+#else
+static inline int dosemu_sigaltstack(const stack_t *ss, stack_t *oss)
+{
+  return sigaltstack(ss, oss);
 }
 #endif
 
@@ -47,6 +61,7 @@ extern void SIG_close(void);
 /* signals for Linux's process control of consoles */
 #define SIG_RELEASE     SIGUSR1
 #define SIG_ACQUIRE     SIGUSR2
+#define SIG_THREAD_NOTIFY (SIGRTMIN + 0)
 
 typedef mcontext_t sigcontext_t;
 
@@ -63,7 +78,8 @@ extern int sigchld_enable_handler(pid_t pid, int on);
 extern int sigalrm_register_handler(void (*handler)(void));
 extern void registersig(int sig, void (*handler)(sigcontext_t *,
 	siginfo_t *));
-extern void init_handler(sigcontext_t *scp, int async);
+extern void registersig_std(int sig, void (*handler)(void *));
+extern void init_handler(sigcontext_t *scp, unsigned long uc_flags);
 extern void deinit_handler(sigcontext_t *scp, unsigned long *uc_flags);
 
 extern void dosemu_fault(int, siginfo_t *, void *);
@@ -74,6 +90,7 @@ extern void signal_return_to_dpmi(void);
 extern void signal_unblock_async_sigs(void);
 extern void signal_restore_async_sigs(void);
 extern void signal_set_altstack(int on);
+extern void print_exception_info(sigcontext_t *scp);
 
 extern pthread_t dosemu_pthread_self;
 

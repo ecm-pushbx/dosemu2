@@ -12,6 +12,9 @@
 #define MHPDBG_H
 
 #include <stdarg.h>
+#include <stdint.h>
+
+#include "dosemu_debug.h"
 
 // There is also an argument field shifted 8 bits left
 enum dosdebug_event {
@@ -40,7 +43,7 @@ unsigned int mhp_debug(enum dosdebug_event, unsigned int, unsigned int);
 void mhp_send(void);
 void mhp_input(void);
 void mhp_close(void);
-void mhp_printf(const char *,...);
+void mhp_printf(const char *,...) FORMAT(printf, 1, 2);
 int mhp_getaxlist_value(int v, int mask);
 int mhp_getcsip_value(void);
 void mhp_modify_eip(int delta);
@@ -48,6 +51,9 @@ void mhp_intercept_log(const char *flags, int temporary);
 void mhp_intercept(const char *msg, const char *logflags);
 void mhp_exit_intercept(int errcode);
 int mhpdbg_is_stopped(void);
+int mhp_usermap_move_block(uint16_t oldseg, uint16_t newseg,
+                           uint16_t startoff, uint32_t blklen);
+int mhp_usermap_load_gnuld(const char *fname, uint16_t origin);
 #ifdef USE_MHPDBG
 int mhp_revectored(int inum);
 #else
@@ -84,7 +90,6 @@ extern struct mhpdbg mhpdbg;
 #define IBUFS 100
 #define MAXARG 16
 #define MAXBP 64
-#define MAXSYM 10000
 
 void mhp_cmd(const char *);
 void mhp_bpset(void);
@@ -139,6 +144,7 @@ struct mhpdbgc
    char bpload_cmdline[132];
    unsigned char intxxalt[32];
    struct brkentry brktab[MAXBP];
+   int bpcleared;
 };
 
 #if 0
@@ -150,13 +156,6 @@ extern int restart_cputime (int);
 #define MHP_STOP	mhpdbgc.stopped = 1
 #define MHP_UNSTOP	mhpdbgc.stopped = 0
 #endif
-
-struct symbl2_entry {
-   unsigned short seg;
-   unsigned short off;
-   unsigned char type;
-   char name[49];
-};
 
 extern int traceloop;
 extern char loopbuf[4];

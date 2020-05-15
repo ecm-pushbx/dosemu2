@@ -27,12 +27,15 @@
 #include "instr_dec.h"
 #include "dosemu_debug.h"
 #include "segreg_priv.h"
+#include "msdos_priv.h"
 #include "msdos_ldt.h"
 
 #define LDT_UPDATE_LIM 1
 
 static unsigned char *ldt_backbuf;
 static unsigned char *ldt_alias;
+static uint32_t ldt_h;
+static uint32_t ldt_alias_h;
 static unsigned short dpmi_ldt_alias;
 static int entry_upd;
 
@@ -45,40 +48,71 @@ static int entry_upd;
  * the subsequent DPMI allocations fail. */
 #define XTRA_LDT_LIM (DPMI_page_size * 4)
 
-int msdos_ldt_setup(unsigned char *backbuf, unsigned char *alias)
-{
-    /* NULL can be passed as backbuf if you have R/W LDT alias */
-    ldt_backbuf = backbuf;
-    ldt_alias = alias;
-    entry_upd = -1;
-    return 1;
-}
-
-u_short msdos_ldt_init(int clnt_num)
+unsigned short msdos_ldt_init(void)
 {
     unsigned lim;
-    if (clnt_num > 1)		// one LDT alias for all clients
-	return dpmi_ldt_alias;
-    dpmi_ldt_alias = AllocateDescriptors(1);
-    if (!dpmi_ldt_alias)
-	return 0;
-    lim = ((dpmi_ldt_alias >> 3) + 1) * LDT_ENTRY_SIZE;
-    SetSegmentLimit(dpmi_ldt_alias, PAGE_ALIGN(lim) + XTRA_LDT_LIM - 1);
-    SetSegmentBaseAddress(dpmi_ldt_alias, DOSADDR_REL(ldt_alias));
+    struct SHM_desc shm;
+    unsigned short name_sel;
+    unsigned short alias_sel;
+    dosaddr_t name;
+    uint16_t attrs[PAGE_ALIGN(LDT_ENTRIES*LDT_ENTRY_SIZE) / PAGE_SIZE];
+    int err;
+    int i;
+    int npages = PAGE_ALIGN(LDT_ENTRIES*LDT_ENTRY_SIZE) / PAGE_SIZE;
+    const int name_len = 128;
+
+    name_sel = AllocateDescriptors(1);
+    name = msdos_malloc(name_len);
+    strcpy((char *)MEM_BASE32(name), "ldt_alias");
+    SetSegmentBaseAddress(name_sel, name);
+    SetSegmentLimit(name_sel, name_len - 1);
+    shm.name_selector = name_sel;
+    shm.name_offset32 = 0;
+    shm.req_len = PAGE_ALIGN(LDT_ENTRIES*LDT_ENTRY_SIZE);
+    shm.flags = SHM_NOEXEC;
+    err = DPMIAllocateShared(&shm);
+    assert(!err);
+    ldt_h = shm.handle;
+    ldt_backbuf = MEM_BASE32(shm.addr);
+    err = DPMIAllocateShared(&shm);
+    assert(!err);
+    ldt_alias_h = shm.handle;
+    if (ldt_h == ldt_alias_h)
+	error("DPMI: problems allocating shm\n");
+    ldt_alias = MEM_BASE32(shm.addr);
+    msdos_free(name);
+    FreeDescriptor(name_sel);
+    for (i = 0; i < npages; i++)
+	attrs[i] = 0x83;	// NX, RO
+    DPMISetPageAttributes(shm.handle, 0, attrs, npages);
+
+    entry_upd = -1;
+    alias_sel = AllocateDescriptors(1);
+    assert(alias_sel);
+    lim = ((alias_sel >> 3) + 1) * LDT_ENTRY_SIZE;
+    SetSegmentLimit(alias_sel, PAGE_ALIGN(lim) + XTRA_LDT_LIM - 1);
+    SetSegmentBaseAddress(alias_sel, shm.addr);
+    /* pre-fill back-buffer */
+    for (i = 0x10; i <= (alias_sel >> 3); i++)
+      GetDescriptor((i << 3) | 7, (unsigned int *)
+          &ldt_backbuf[i * LDT_ENTRY_SIZE]);
+    dpmi_ldt_alias = alias_sel;
     return dpmi_ldt_alias;
 }
 
-void msdos_ldt_done(int clnt_num)
+void msdos_ldt_done(void)
 {
     unsigned short alias;
-    if (clnt_num > 1)
-	return;
+
     if (!dpmi_ldt_alias)
 	return;
     alias = dpmi_ldt_alias;
     /* setting to zero before clearing or it will re-instantiate */
     dpmi_ldt_alias = 0;
     FreeDescriptor(alias);
+    ldt_backbuf = NULL;
+    DPMIFreeShared(ldt_alias_h);
+    DPMIFreeShared(ldt_h);
 }
 
 int msdos_ldt_fault(sigcontext_t *scp, uint16_t sel)
@@ -182,18 +216,27 @@ out:
   entry_upd = -1;
 }
 
+int msdos_ldt_access(unsigned char *cr2)
+{
+    return cr2 >= ldt_alias && cr2 < ldt_alias + LDT_ENTRIES * LDT_ENTRY_SIZE;
+}
+
+void msdos_ldt_write(sigcontext_t *scp, uint32_t op, int len)
+{
+    direct_ldt_write(scp, _cr2 - (unsigned long)ldt_alias, (char *)&op, len);
+}
+
 int msdos_ldt_pagefault(sigcontext_t *scp)
 {
     uint32_t op;
     int len;
 
-    if ((unsigned char *)_cr2 < ldt_alias ||
-	  (unsigned char *)_cr2 >= ldt_alias + LDT_ENTRIES * LDT_ENTRY_SIZE)
+    if (!msdos_ldt_access((unsigned char *)_cr2))
 	return 0;
     len = decode_memop(scp, &op);
     if (!len)
 	return 0;
 
-    direct_ldt_write(scp, _cr2 - (unsigned long)ldt_alias, (char *)&op, len);
+    msdos_ldt_write(scp, op, len);
     return 1;
 }

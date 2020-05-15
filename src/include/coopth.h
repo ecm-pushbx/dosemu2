@@ -39,15 +39,17 @@ void *coopth_pop_user_data(int tid);
 void *coopth_pop_user_data_cur(void);
 int coopth_get_tid(void);
 void coopth_ensure_sleeping(int tid);
+void coopth_ensure_single(int tid);
 void coopth_yield(void);
 void coopth_wait(void);
 void coopth_sleep(void);
-void coopth_sched(void);
+int coopth_sched(void);
 int coopth_sched_cond(void);
 void coopth_detach(void);
 void coopth_attach_to_cur(int tid);
 void coopth_attach(void);
 void coopth_leave(void);
+void coopth_abandon(void);
 void coopth_exit(void);
 void coopth_wake_up(int tid);
 void coopth_cancel(int tid);
@@ -56,6 +58,7 @@ void coopth_run(void);
 void coopth_run_tid(int tid);
 int coopth_wants_sleep(void);
 void coopth_set_ctx_checker(int (*checker)(void));
-jmp_buf *coopth_set_cancel_target(jmp_buf *target);
+void coopth_cancel_disable(void);
+void coopth_cancel_enable(void);
 
 #endif

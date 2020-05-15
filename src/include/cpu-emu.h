@@ -64,9 +64,6 @@ extern void e_priv_iopl(int);
 extern int IsV86Emu;
 extern int IsDpmiEmu;
 
-extern volatile int CEmuStat;
-extern volatile int InCompiledCode;
-
 void enter_cpu_emu(void);
 void leave_cpu_emu(void);
 void avltr_destroy(void);
@@ -85,6 +82,10 @@ void e_invalidate_full(unsigned data, int cnt);
 #define e_invalidate(x,y)
 #define e_invalidate_full(x,y)
 #endif
+
+/* called from dos2linux.c */
+void emu_check_read_pagefault(dosaddr_t addr);
+int emu_check_write_pagefault(dosaddr_t addr, uint32_t op, int len);
 
 /* called from cpu.c */
 void init_emu_cpu (void);

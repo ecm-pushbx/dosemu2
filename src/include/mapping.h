@@ -43,6 +43,7 @@
 #define MAPPING_INIT_LOWRAM	0x000200
 #define MAPPING_EXTMEM		0x000400
 #define MAPPING_KVM		0x000800
+#define MAPPING_IMMEDIATE	0x001000
 
 /* usage as: (kind of mapping required) */
 #define MAPPING_KMEM		0x010000
@@ -69,12 +70,13 @@ void *realloc_mapping (int cap, void *addr, size_t oldsize, size_t newsize);
 
 void *mmap_mapping(int cap, dosaddr_t targ, size_t mapsize, int protect);
 void *mmap_mapping_ux(int cap, void *target, size_t mapsize, int protect);
+void *mmap_file_ux(int cap, void *target, size_t mapsize, int protect,
+    int flags, int fd);
 
 typedef void *alias_mapping_type(int cap, void *target, size_t mapsize, int protect, void *source);
 int alias_mapping(int cap, dosaddr_t targ, size_t mapsize, int protect, void *source);
 void *alias_mapping_high(int cap, size_t mapsize, int protect, void *source);
 
-typedef int munmap_mapping_type(int cap, void *addr, size_t mapsize);
 int munmap_mapping(int cap, dosaddr_t targ, size_t mapsize);
 int mprotect_mapping(int cap, dosaddr_t targ, size_t mapsize, int protect);
 
@@ -86,12 +88,12 @@ struct mappingdrivers {
   alloc_mapping_type *alloc;
   free_mapping_type *free;
   realloc_mapping_type *realloc;
-  munmap_mapping_type *munmap;
   alias_mapping_type *alias;
 };
 char *decode_mapping_cap(int cap);
 
 extern struct mappingdrivers mappingdriver_shm;
+extern struct mappingdrivers mappingdriver_mshm;
 extern struct mappingdrivers mappingdriver_ashm;
 extern struct mappingdrivers mappingdriver_file;
 
@@ -105,7 +107,7 @@ int map_hardware_ram(char type);
 int map_hardware_ram_manual(size_t base, dosaddr_t vbase);
 int unmap_hardware_ram(char type);
 int register_hardware_ram(int type, unsigned base, unsigned size);
-unsigned get_hardware_ram(unsigned addr);
+unsigned get_hardware_ram(unsigned addr, uint32_t size);
 void list_hardware_ram(void (*print)(const char *, ...));
 void *mapping_find_hole(unsigned long start, unsigned long stop,
 	unsigned long size);

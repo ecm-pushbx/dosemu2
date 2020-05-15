@@ -138,6 +138,7 @@ static void mouse_do_cur(int callback), mouse_update_cursor(int clipped);
 static void mouse_reset_to_current_video_mode(void);
 
 static void int33_mouse_move_buttons(int lbutton, int mbutton, int rbutton, void *udata);
+static void int33_mouse_move_button(int num, int press, void *udata);
 static void int33_mouse_move_wheel(int dy, void *udata);
 static void int33_mouse_move_relative(int dx, int dy, int x_range, int y_range, void *udata);
 static void int33_mouse_move_mickeys(int dx, int dy, void *udata);
@@ -292,10 +293,11 @@ mouse_helper(struct vm86_regs *regs)
       unsigned ax = popw(ssp, sp);
       int mode = popw(ssp, sp);
 
-      if (!mice->ignorevesa && mode >= 0x100 && ax == 0x4f) {
+      if (!mice->ignorevesa && mode >= 0x100 &&
+	    (mode & 0xff00) != 0x1100 && ax == 0x4f) {
 	/* no chargen function; check if vesa mode set successful */
 	vidmouse_set_video_mode(mode);
-      } else {
+      } else if ((mode & 0xff00) != 0x1100) {
 	vidmouse_set_video_mode(-1);
       }
       mouse_reset_to_current_video_mode();
@@ -408,6 +410,8 @@ void mouse_ps2bios(void)
 int
 mouse_int(void)
 {
+  if (!mice->intdrv)
+    return 0;
   m_printf("MOUSE: int 33h, ax=%x bx=%x\n", LWORD(eax), LWORD(ebx));
 
   switch (LWORD(eax)) {
@@ -478,7 +482,7 @@ mouse_int(void)
     break;
 
   case 0x11:
-    LWORD(eax) = 0x574D;;
+    LWORD(eax) = 0x574D;
     LWORD(ebx) = 0;
     LWORD(ecx) = 1;
     break;
@@ -777,6 +781,10 @@ mouse_software_reset(void)
   mouse.ps2.cs = 0;
   mouse.ps2.ip = 0;
   mouse_enable_internaldriver();
+  if (mouse.cursor_on < -1) {
+    m_printf("MOUSE: normalizing hide count, %i\n", mouse.cursor_on);
+    mouse.cursor_on = -1;
+  }
 
   /* Return 0xffff on success, 0x21 on failure */
   LWORD(eax) = 0xffff;
@@ -1170,7 +1178,8 @@ static void scale_coords3(int x, int y, int x_range, int y_range,
 
 	get_scale_range(&mx_range, &my_range);
 	scale_coords2(x, y, x_range, y_range, mx_range, my_range,
-			speed_x, speed_y, s_x, s_y);
+			min(speed_x, mice->init_speed_x),
+			min(speed_y, mice->init_speed_y), s_x, s_y);
 }
 
 static void scale_coords(int x, int y, int x_range, int y_range,
@@ -1180,7 +1189,10 @@ static void scale_coords(int x, int y, int x_range, int y_range,
 
 	get_scale_range(&mx_range, &my_range);
 	scale_coords2(x, y, x_range, y_range, mx_range, my_range,
-			mouse.speed_x, mouse.speed_y, s_x, s_y);
+		/* simcity hack: only handle cursor speed-ups but ignore
+		 * slow-downs. */
+		min(mouse.speed_x, mice->init_speed_x),
+		min(mouse.speed_y, mice->init_speed_y), s_x, s_y);
 }
 
 static void mouse_reset(void)
@@ -1210,7 +1222,6 @@ static void mouse_reset(void)
 
   mouse.cursor_on = -1;
   mouse.lbutton = mouse.mbutton = mouse.rbutton = 0;
-  mouse.oldlbutton = mouse.oldmbutton = mouse.oldrbutton = 1;
   mouse.lpcount = mouse.mpcount = mouse.rpcount = 0;
   mouse.lrcount = mouse.mrcount = mouse.rrcount = 0;
   mouse.wmcount = 0;
@@ -1519,10 +1530,14 @@ void
 mouse_version(void)
 {
   LWORD(ebx) = MOUSE_VERSION;
-  HI(cx) = 4;			/* ps2 mouse */
-  LO(cx) = 0;			/* Basically, treat the internal mouse */
-				/* driver as an IBM PS/2 mouse */
-  m_printf("MOUSE: get version %04x\n", LWORD(ebx));
+  if (mice->com == -1) {
+    HI(cx) = 4;			/* ps2 mouse */
+    LO(cx) = 0;
+  } else {
+    HI(cx) = 2;			/* serial mouse */
+    LO(cx) = com_cfg[mice->com].irq;
+  }
+  m_printf("MOUSE: get version %04x, 0x%04x\n", LWORD(ebx), LWORD(ecx));
 }
 
 void
@@ -1534,6 +1549,7 @@ mouse_disable_internaldriver()
 
   mouse.enabled = FALSE;
 
+  mouse_client_show_cursor(1);
   m_printf("MOUSE: Disable InternalDriver\n");
 }
 
@@ -1541,6 +1557,7 @@ void
 mouse_enable_internaldriver()
 {
   mouse.enabled = TRUE;
+  mouse_client_show_cursor(mouse.cursor_on >= 0);
   m_printf("MOUSE: Enable InternalDriver\n");
 }
 
@@ -1620,8 +1637,9 @@ void mouse_keyboard(Boolean make, t_keysym key)
 	if (state.l) {
 		dx -= 1;
 	}
-	mouse_move_mickeys(dx, dy);
-	mouse_move_buttons(state.lbutton, state.mbutton, state.rbutton);
+	mouse_move_mickeys(dx, dy, MOUSE_VKBD);
+	mouse_move_buttons(state.lbutton, state.mbutton, state.rbutton,
+		MOUSE_VKBD);
 }
 
 static int mouse_round_coords2(int x, int y, int *r_x, int *r_y)
@@ -1774,21 +1792,51 @@ static void int33_mouse_move_buttons(int lbutton, int mbutton, int rbutton, void
 			mbutton = 1;  /* Set middle button */
 		}
 	}
-	mouse.oldlbutton = mouse.lbutton;
-	mouse.oldmbutton = mouse.mbutton;
-	mouse.oldrbutton = mouse.rbutton;
-	mouse.lbutton = !!lbutton;
-	mouse.mbutton = !!mbutton;
-	mouse.rbutton = !!rbutton;
 	/*
 	 * update the event mask
 	 */
-	if (mouse.oldlbutton != mouse.lbutton)
-	   mouse_lb();
-        if (mouse.threebuttons && mouse.oldmbutton != mouse.mbutton)
-	   mouse_mb();
-	if (mouse.oldrbutton != mouse.rbutton)
-	   mouse_rb();
+	if (lbutton != mouse.lbutton) {
+	    mouse.lbutton = lbutton;
+	    mouse_lb();
+	}
+	if (mouse.threebuttons && mbutton != mouse.mbutton) {
+	    mouse.mbutton = mbutton;
+	    mouse_mb();
+	}
+	if (rbutton != mouse.rbutton) {
+	    mouse.rbutton = rbutton;
+	    mouse_rb();
+	}
+}
+
+static void int33_mouse_move_button(int num, int press, void *udata)
+{
+	if (dragged.skipped) {
+		dragged.skipped = 0;
+		do_move_abs(dragged.x, dragged.y, dragged.x_range,
+			    dragged.y_range);
+	}
+
+	switch (num) {
+	case 0:
+		if (press != mouse.lbutton) {
+		    mouse.lbutton = press;
+		    mouse_lb();
+		}
+		break;
+	case 1:
+		if (mouse.threebuttons && press != mouse.mbutton) {
+		    mouse.mbutton = press;
+		    mouse_mb();
+		}
+		break;
+	case 2:
+		if (press != mouse.rbutton) {
+		    mouse.rbutton = press;
+		    mouse_rb();
+		}
+		break;
+	}
 }
 
 static void int33_mouse_move_wheel(int dy, void *udata)
@@ -1857,12 +1905,7 @@ static int move_abs_coords(int x, int y, int x_range, int y_range)
 	long long new_x, new_y;
 	int clipped, c_x, c_y, oldx = get_mx(), oldy = get_my();
 
-	/* simcity hack: only handle cursor speed-ups but ignore
-	 * slow-downs. */
-	scale_coords3(x, y, x_range, y_range,
-			min(mouse.speed_x, mice->init_speed_x),
-			min(mouse.speed_y, mice->init_speed_y),
-			&new_x, &new_y);
+	scale_coords(x, y, x_range, y_range, &new_x, &new_y);
 	/* for visible cursor always recalc deltas */
 	if (mouse.cursor_on >= 0)
 		mouse.x_delta = mouse.y_delta = 0;
@@ -1875,8 +1918,7 @@ static int move_abs_coords(int x, int y, int x_range, int y_range)
 	    mouse.x_delta = c_x - new_x;
 	    mouse.y_delta = c_y - new_y;
 	}
-	mouse.unsc_x = get_unsc_x(c_x);
-	mouse.unsc_y = get_unsc_y(c_y);
+	setxy(c_x, c_y);
 
 	m_printf("mouse_move_absolute(%d, %d, %d, %d) %d %d -> %d %d \n",
 		 x, y, x_range, y_range, oldx, oldy, get_mx(), get_my());
@@ -2210,14 +2252,6 @@ static void mouse_curtick(void)
   mouse_update_cursor(0);
 }
 
-void mouse_late_init(void)
-{
-  if (!mice->intdrv)
-    return;
-  mouse_client_post_init();
-  SETIVEC(0x74, BIOSSEG, Mouse_ROUTINE_OFF);
-}
-
 /*
  * DANG_BEGIN_FUNCTION mouse_init
  *
@@ -2249,7 +2283,6 @@ static int int33_mouse_init(void)
   else
   	mouse.threebuttons = FALSE;
 
-  /* Set to disabled, will be enabled in post_boot() */
   mouse.enabled = FALSE;
 
   mice->native_cursor = 1;
@@ -2271,21 +2304,27 @@ static int int33_mouse_init(void)
   return 1;
 }
 
-static int int33_mouse_accepts(void *udata)
+static int int33_mouse_accepts(int from, void *udata)
 {
-  /* if sermouse.c accepts events, we only accept events
-   * that are explicitly sent to int33 (they ignore .accepts member) */
-  if (mice->com != -1 && mousedrv_accepts("serial mouse"))
+  if (!mice->intdrv)
     return 0;
-  return mice->intdrv;
+  /* if commouse.c is active, we only accept events from it,
+   * and nothing else. Those events ignore .accepts member. */
+  if (mice->com != -1)
+    return 0;
+  /* for 2 mices see if source is ours */
+  if (mice->type != mice->dev_type)
+    return (from == mice->type);
+  return 1;
 }
 
-void mouse_post_boot(void)
+void mouse_late_init(void)
 {
   if (!mice->intdrv) return;
-  /* This is needed here to revectoring the interrupt, after dos
-   * has revectored it. --EB 1 Nov 1997 */
-  SETIVEC(0x33, Mouse_SEG, Mouse_INT_OFF);
+
+  mouse.enabled = FALSE;
+  mouse.cursor_on = -1;
+  mouse_client_show_cursor(1);
 }
 
 void mouse_set_win31_mode(void)
@@ -2314,16 +2353,17 @@ dosemu_mouse_close(void)
 */
 
 struct mouse_drv int33_mouse = {
-  int33_mouse_init,
-  int33_mouse_accepts,
-  int33_mouse_move_buttons,
-  int33_mouse_move_wheel,
-  int33_mouse_move_relative,
-  int33_mouse_move_mickeys,
-  int33_mouse_move_absolute,
-  int33_mouse_drag_to_corner,
-  int33_mouse_enable_native_cursor,
-  "int33 mouse"
+  .init = int33_mouse_init,
+  .accepts = int33_mouse_accepts,
+  .move_button = int33_mouse_move_button,
+  .move_buttons = int33_mouse_move_buttons,
+  .move_wheel = int33_mouse_move_wheel,
+  .move_relative = int33_mouse_move_relative,
+  .move_mickeys = int33_mouse_move_mickeys,
+  .move_absolute = int33_mouse_move_absolute,
+  .drag_to_corner = int33_mouse_drag_to_corner,
+  .enable_native_cursor = int33_mouse_enable_native_cursor,
+  .name = "int33 mouse",
 };
 
 CONSTRUCTOR(static void int33_mouse_register(void))

@@ -54,10 +54,17 @@ static void *alias_mapping_file(int cap, void *target, size_t mapsize, int prote
     target = NULL;
   addr =  mmap(target, mapsize, protect, MAP_SHARED | fixed, tmpfile_fd, offs);
   if (addr == MAP_FAILED) {
-    addr =  mmap(target, mapsize, protect & ~PROT_EXEC, MAP_SHARED | fixed,
+    addr = mmap(target, mapsize, protect & ~PROT_EXEC, MAP_SHARED | fixed,
 		 tmpfile_fd, offs);
-    if (addr != MAP_FAILED)
-      mprotect(addr, mapsize, protect);
+    if (addr != MAP_FAILED) {
+      int ret = mprotect(addr, mapsize, protect);
+      if (ret == -1) {
+        perror("mprotect()");
+        error("shared memory mprotect failed, exiting\n");
+        leavedos(2);
+        return NULL;
+      }
+    }
   }
 #if 1
   Q_printf("MAPPING: alias_map, fileoffs %llx to %p size %zx, result %p\n",
@@ -108,13 +115,10 @@ static int open_mapping_f(int cap)
     		MAP_SHARED, tmpfile_fd, 0);
     if (mpool == MAP_FAILED ||
 	mprotect(mpool, mapsize, PROT_READ|PROT_WRITE|PROT_EXEC) == -1) {
-      char *err = strerror(errno);
-      char s[] = "MAPPING: cannot size temp file pool, %s\n";
+      error("MAPPING: cannot mmap shared memory pool, %s\n", strerror(errno));
       discardtempfile();
-      if (!cap) {
-	Q_printf(s,err);
+      if (!cap)
 	return 0;
-      }
       leavedos(2);
     }
     /* the memory pool itself can just be rw though */
@@ -199,7 +203,7 @@ static int open_mapping_pshm(int cap)
   int ret;
 
   if (tmpfile_fd < 0) {
-    ret = asprintf(&name, "%s%d", "dosemu_", getpid());
+    ret = asprintf(&name, "/dosemu_%d", getpid());
     assert(ret != -1);
 
     tmpfile_fd = shm_open(name, O_RDWR | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
@@ -209,6 +213,27 @@ static int open_mapping_pshm(int cap)
     }
     shm_unlink(name);
     free(name);
+    if (!open_mapping_f(cap))
+      return 0;
+  }
+  return 1;
+}
+#endif
+
+#ifdef HAVE_MEMFD_CREATE
+static int open_mapping_mshm(int cap)
+{
+  char *name;
+  int ret;
+
+  if (tmpfile_fd < 0) {
+    ret = asprintf(&name, "dosemu_%d", getpid());
+    assert(ret != -1);
+
+    tmpfile_fd = memfd_create(name, 0);
+    free(name);
+    if (tmpfile_fd == -1)
+      return 0;
     if (!open_mapping_f(cap))
       return 0;
   }
@@ -264,13 +289,6 @@ static void *realloc_mapping_file(int cap, void *addr, size_t oldsize, size_t ne
   return (void *)-1;
 }
 
-static int munmap_mapping_file(int cap, void *addr, size_t mapsize)
-{
-  Q__printf("MAPPING: unmap, cap=%s, addr=%p, size=%zx\n",
-	cap, addr, mapsize);
-  return munmap(addr, mapsize);
-}
-
 #ifdef HAVE_SHM_OPEN
 struct mappingdrivers mappingdriver_shm = {
   "mapshm",
@@ -280,7 +298,19 @@ struct mappingdrivers mappingdriver_shm = {
   alloc_mapping_file,
   free_mapping_file,
   realloc_mapping_file,
-  munmap_mapping_file,
+  alias_mapping_file
+};
+#endif
+
+#ifdef HAVE_MEMFD_CREATE
+struct mappingdrivers mappingdriver_mshm = {
+  "mapmshm",
+  "memfd mapping",
+  open_mapping_mshm,
+  close_mapping_file,
+  alloc_mapping_file,
+  free_mapping_file,
+  realloc_mapping_file,
   alias_mapping_file
 };
 #endif
@@ -293,6 +323,5 @@ struct mappingdrivers mappingdriver_file = {
   alloc_mapping_file,
   free_mapping_file,
   realloc_mapping_file,
-  munmap_mapping_file,
   alias_mapping_file
 };

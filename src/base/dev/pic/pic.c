@@ -144,6 +144,8 @@
 #define us unsigned
 static void pic_activate(void);
 
+#define TIMER0_FLOOD_THRESHOLD 50000
+
 static unsigned long pic1_isr;         /* second isr for pic1 irqs */
 static unsigned long pic_irq2_ivec = 0;
 
@@ -253,6 +255,8 @@ static unsigned char pic0_icw_state; /* 0-3=>next port 1 write= mask,ICW2,3,4 */
 static unsigned char pic1_icw_state;
 static unsigned char pic0_cmd; /* 0-3=>last port 0 write was none,ICW1,OCW2,3*/
 static unsigned char pic1_cmd;
+
+static int pic_pending_masked(uint8_t mask);
 
 /* DANG_BEGIN_FUNCTION pic_print
  *
@@ -571,7 +575,12 @@ void run_irqs(void)
        /* don't allow HW interrupts in force trace mode */
        pic_activate();
        if (!isset_IF()) {
-		if (pic_pending())
+		/* try to detect timer flood, and not set VIP if it is there.
+		 * See https://github.com/stsp/dosemu2/issues/918
+		 */
+		if (pic_pending() && (pic_sys_time < pic_dos_time +
+				TIMER0_FLOOD_THRESHOLD ||
+				pic_pending_masked(1 << PIC_IRQ0)))
 			set_VIP();
 		return;                      /* exit if ints are disabled */
        }
@@ -584,7 +593,7 @@ void run_irqs(void)
         * irq code actually runs, will reset the bits.  We also reset them here,
         * since dos code won't necessarily run.
         */
-       while((local_pic_ilevel = pic_get_ilevel()) != -1) { /* while something to do*/
+       if((local_pic_ilevel = pic_get_ilevel()) != -1) { /* if something to do*/
                pic_print(1, "Running irq lvl ", local_pic_ilevel, "");
                clear_bit(local_pic_ilevel, &pic_irr);
 	       /* pic_isr bit is set in do_irq() */
@@ -592,6 +601,12 @@ void run_irqs(void)
 	    	      pic_iinfo[local_pic_ilevel].func(local_pic_ilevel) : 1);      /* run the function */
 	       if (ret) {
 		       do_irq(local_pic_ilevel);
+		       if (pic_pending())
+			       /* If special mask mode is active, multiple IRQs
+			          can be pending. In that cases we need to
+			          return from dos code asap when it enables
+				  interrupts to schedule the next interrupt. */
+			       set_VIP();
 	       }
        }
 }
@@ -634,9 +649,12 @@ static void do_irq(int ilevel)
 
     intr=pic_iinfo[ilevel].ivec;
 
-     if (pic_iinfo[ilevel].callback)
-        pic_iinfo[ilevel].callback();
-     else {
+     if (pic_iinfo[ilevel].callback) {
+       if(in_dpmi_pm())
+         fake_pm_int();
+       fake_int_to(BIOSSEG, EOI_OFF);
+       pic_iinfo[ilevel].callback();
+     } else {
        if (dpmi_active()) run_pm_int(intr);
        else {
  /* schedule the requested interrupt, then enter the vm86() loop */
@@ -759,22 +777,34 @@ void pic_watch(hitimer_u *s_time)
   pic_activate();
 }
 
-static int pic_get_ilevel(void)
+static int pic_get_ilevel_masked(uint8_t mask)
 {
     int local_pic_ilevel, old_ilevel;
-    int int_req = (pic_irr & ~(pic_isr | pic_imr));
+    int int_req = (pic_irr & ~(pic_isr | pic_imr | mask));
     if (!int_req)
 	return -1;
     local_pic_ilevel = find_bit(int_req);    /* find out what it is  */
     old_ilevel = find_bit(pic_isr);
+    /* note that this priority check is a no-op if special mask mode
+       is active (ie. pic_smm == 32, and local_pic_level is always <= 31) */
     if (local_pic_ilevel >= old_ilevel + pic_smm)  /* priority check */
 	return -1;
     return local_pic_ilevel;
 }
 
+static int pic_get_ilevel(void)
+{
+    return pic_get_ilevel_masked(0);
+}
+
 int pic_pending(void)
 {
     return (pic_get_ilevel() != -1);
+}
+
+int pic_pending_masked(uint8_t mask)
+{
+    return (pic_get_ilevel_masked(mask) != -1);
 }
 
 int pic_irq_active(int num)
@@ -798,7 +828,11 @@ static void pic_activate(void)
 {
   hitimer_t earliest;
   int timer, count;
-  unsigned pic_newirr = pic_pirr & ~(pic_irr | pic_isr);
+  unsigned pic_newirr;
+
+  if (pic_pending())
+    return;
+  pic_newirr = pic_pirr & ~(pic_irr | pic_isr);
   pic_irr |= pic_newirr;
   pic_pirr &= ~pic_newirr;
 
@@ -818,7 +852,9 @@ static void pic_activate(void)
    if(count) pic_print(2,"Activated ",count, " interrupts.");
    pic_print2(2,"Activate ++ dos time to ",earliest, " ");
    pic_print2(2,"pic_sys_time is ",pic_sys_time," ");
-   /*if(!pic_icount)*/ pic_dos_time = pic_itime[32] = earliest;
+   pic_itime[32] = earliest;
+   if (count)
+      pic_dos_time = earliest;
 }
 
 /* DANG_BEGIN_FUNCTION pic_sched
@@ -878,7 +914,7 @@ int CAN_SLEEP(void)
   if (dosemu_frozen)
     return 1;
   return (!(pic_isr || (REG(eflags) & VIP) || signal_pending() ||
-    (pic_sys_time > pic_dos_time) || in_leavedos));
+    (pic_sys_time > pic_dos_time + TIMER0_FLOOD_THRESHOLD) || in_leavedos));
 }
 
 void pic_init(void)

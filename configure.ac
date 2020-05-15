@@ -6,7 +6,7 @@ dnl AM_INIT_AUTOMAKE includes them
 AM_SILENT_RULES
 AM_DEP_TRACK
 AM_MAINTAINER_MODE
-AC_CONFIG_SRCDIR(src/emu.c)
+AC_CONFIG_SRCDIR(src/include/emu.h)
 AC_PREREQ(2.64)
 
 AC_CONFIG_HEADER(src/include/config.hh)
@@ -40,6 +40,7 @@ fi
 AC_ARG_WITH(target-bits-32, [  --with-target-bits-32 ],
   CPPFLAGS="$CPPFLAGS -m32"
   LDFLAGS="$LDFLAGS -m32"
+  ASFLAGS="--32"
   with_target_bits="32"
 )
 AC_PROG_INSTALL
@@ -71,6 +72,10 @@ AC_PROG_AWK
 if test "$ac_cv_prog_AWK" != "gawk" ; then
   AC_MSG_ERROR(Install gawk and retry.)
 fi
+AC_CHECK_PROG(PKG_CONFIG, pkg-config, yes)
+if test -z "$PKG_CONFIG"; then
+  AC_MSG_ERROR(Install pkg-config and retry.)
+fi
 
 dnl Checks for libraries.
 
@@ -92,6 +97,8 @@ AC_LINK_IFELSE([AC_LANG_PROGRAM([[#include <assert.h>]], [[
 AC_CHECK_LIB(rt, shm_open)
 dnl below defines HAVE_SHM_OPEN
 AC_CHECK_FUNCS(shm_open)
+
+AC_CHECK_FUNCS(memfd_create)
 
 dnl Here is where we do our stuff
 
@@ -128,11 +135,13 @@ AC_DEFINE_DIR([SYSTEM_XFONTS_PATH], [x11fontdir], [ Directory for x11 fonts ])
 CONFIG_HOST='linux'
 AC_SUBST(CONFIG_HOST)
 
-machine=`uname -m`
+machine=`"$CC" -dumpmachine | cut -d- -f1`
 
 DOSEMU_CFLAGS="-Wall -Wstrict-prototypes -Wmissing-declarations \
 -Wnested-externs -fms-extensions -pthread -imacros config.hh \
 -Wno-unused-result -Wcast-qual -Wwrite-strings"
+AX_CHECK_COMPILE_FLAG([-Waddress-of-packed-member -Werror],
+  [DOSEMU_CFLAGS="$DOSEMU_CFLAGS -Wno-address-of-packed-member"])
 DOSEMU_LDFLAGS="-pthread"
 
 AC_CHECK_LIB(m, pow)
@@ -213,6 +222,15 @@ fi
 if test "$enable_plugins" = "no"; then
     enable_plugins=""
 fi
+AC_ARG_WITH(plugin-options,
+    [AS_HELP_STRING([--with-plugin-options=PLUGIN,OPTS],
+        [Pass options OPTS to plugin PLUGIN])],
+    [
+        plu=`echo $withval |cut -d "," -f 1`
+        val=`echo $withval |cut -d "," -f 2`
+        export ${plu}_OPTS="$val"
+    ]
+)
 AC_MSG_NOTICE([Creating plug-in hooks...])
 PLUGINSUBDIRS=
 ST_PLUGINSUBDIRS=
@@ -226,6 +244,13 @@ for i in $(echo $enable_plugins | tr ',' ' '); do
         fi
     fi
 done
+PLUGINS=`echo $PLUGINSUBDIRS | $SED 's/plugin\//\n\t/g'`
+
+FDPP_PLU=`echo $PLUGINS | $EGREP 'fdpp'`
+AC_ARG_ENABLE(fdpp,
+  [AS_HELP_STRING([--disable-fdpp], [compile without fdpp support])],,
+  enable_fdpp="yes"
+)
 
 AC_ARG_ENABLE(system_wa,
   AS_HELP_STRING([--disable-system-wa], [compile without system-specific
@@ -369,18 +394,23 @@ if test "$machine" = "x86_64" -a "$with_target_bits" != "32" -a \
 else
     AC_MSG_NOTICE(Compiling as non-PIE...)
     DOSEMU_CFLAGS="$DOSEMU_CFLAGS -fno-pie"
-    DOSEMU_LDFLAGS="$DOSEMU_LDFLAGS -no-pie"
+    AX_CHECK_COMPILE_FLAG([-no-pie],
+      [DOSEMU_LDFLAGS="$DOSEMU_LDFLAGS -no-pie"])
 fi
 
 if test "$enable_asan" = "yes"; then
+  AX_CHECK_LINK_FLAG([-fsanitize=address], [
     DOSEMU_CFLAGS="$DOSEMU_CFLAGS -fsanitize=address"
     LDFLAGS="$LDFLAGS -fsanitize=address"
     AC_MSG_NOTICE(enabling address sanitizer)
+  ])
 fi
 if test "$enable_ubsan" = "yes"; then
+  AX_CHECK_LINK_FLAG([-fsanitize=undefined], [
     DOSEMU_CFLAGS="$DOSEMU_CFLAGS -fsanitize=undefined -fno-sanitize=alignment"
     LDFLAGS="$LDFLAGS -fsanitize=undefined"
     AC_MSG_NOTICE(enabling UB sanitizer)
+  ])
 fi
 if test "$enable_profile" = "yes"; then
     DOSEMU_CFLAGS="$DOSEMU_CFLAGS -pg -no-pie"
@@ -394,6 +424,9 @@ if test "$enable_debug" = "yes" ; then
     # simx86 is too slow on gcc without -O
     DOSEMU_CFLAGS="$DOSEMU_CFLAGS -O0"
   fi
+  if test "$use_clang" = "yes" ; then
+    DOSEMU_CFLAGS="$DOSEMU_CFLAGS -fdebug-macro"
+  fi
 elif test -z "$CFLAGS" ; then
   DOSEMU_CFLAGS="$DOSEMU_CFLAGS -O2"
 fi
@@ -401,7 +434,6 @@ fi
 DOSEMU_CFLAGS="${DOSEMU_CFLAGS} ${OPT} ${PIPE}"
 DOSEMU_CPPFLAGS="${DOSEMU_CPPFLAGS} -MMD -DCFLAGS_STR=\"$DOSEMU_CFLAGS $CFLAGS\""
 DOSEMU_VERSION=`cd $srcdir && ./getversion -b`
-ASFLAGS="--32"
 AS_LDFLAGS="-melf_i386"
 
 AC_SUBST(ASFLAGS)
@@ -435,7 +467,7 @@ AC_CONFIG_COMMANDS([Makefile],
       builddir="$wd"
     fi
     mkdir -p `(cd $abssrcdir; find doc man etc src -path src/lib -prune -o -type d -print)`
-    for i in `(cd $abssrcdir; find . -path $builddir -prune -o -name Makefile -print)`; do
+    for i in `(cd $abssrcdir; find . -path $builddir -prune -o -name Makefile -print -o -name *.mak -print)`; do
       echo  $LN_S -f $abssrcdir/${i#./} $i
       $LN_S -f $abssrcdir/${i#./} $i
     done
@@ -481,9 +513,6 @@ AH_TEMPLATE([USE_DL_PLUGINS],
 AH_TEMPLATE([HAVE_BACKTRACE],
 [ Define this for backtrace() functionality ])
 
-AH_TEMPLATE([HAVE_SIGCONTEXT_SS],
-[ Define this if struct sigcontext has .ss field ])
-
 AH_TEMPLATE([X86_EMULATOR],
 [ Define this to use the X86 CPU emulator ])
 
@@ -505,8 +534,10 @@ AH_TEMPLATE([CMDS_SUFF],
 AC_OUTPUT
 
 dnl Print some warnings (if neccessary)
+if test "$enable_fdpp" != "no" -a -z "$FDPP_PLU"; then
+  AC_MSG_ERROR([fdpp not available!])
+fi
 
-PLUGINS=`echo $PLUGINSUBDIRS | $SED 's/plugin\//\n\t/g'`
 AC_MSG_RESULT()
 AC_MSG_RESULT(Enabling plugins: $PLUGINS)
 VID_PLU=`echo $PLUGINS | $EGREP 'sdl|X|term|sdl1'`
@@ -519,7 +550,6 @@ if test -z "$AUD_PLU"; then
   AC_MSG_RESULT()
   AC_MSG_WARN([No audio plugins available!])
 fi
-FDPP_PLU=`echo $PLUGINS | $EGREP 'fdpp'`
 if test -z "$FDPP_PLU"; then
   AC_MSG_RESULT()
   AC_MSG_WARN([fdpp not available!])

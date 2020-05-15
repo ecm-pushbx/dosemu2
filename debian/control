@@ -29,7 +29,9 @@ Build-Depends:
     libao-dev,
     libvdeplug-dev,
     libreadline-dev,
+    libjson-c-dev,
     binutils-dev,
+    pkg-config,
     fdpp
 Homepage: http://stsp.github.io/dosemu2/
 
@@ -37,7 +39,7 @@ Package: dosemu2
 Replaces: dosemu
 Conflicts: dosemu
 Architecture: i386 amd64
-Depends: ${misc:Depends}, ${shlibs:Depends}
+Depends: ${misc:Depends}, ${shlibs:Depends}, fdpp, comcom32
 Recommends: ladspa-sdk, ${shlibs-:Recommends}
 Suggests: fluid-soundfont-gm, vde2
 Description: DOS Emulator for Linux

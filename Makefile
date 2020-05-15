@@ -15,14 +15,25 @@ configure: $(REALTOPDIR)/configure.ac $(REALTOPDIR)/install-sh
 	cd $(@D) && $(REALTOPDIR)/autogen.sh "$(REALTOPDIR)"
 
 Makefile.conf config.status src/include/config.hh: configure
+ifeq ($(findstring $(MAKECMDGOALS), clean realclean pristine distclean),)
 	@echo "Running configure ..."
 	./$<
+else
+	./$< || true
+endif
 
 install: changelog
 
-default clean realclean install uninstall: config.status src/include/config.hh
+default install: config.status src/include/config.hh
 	@$(MAKE) -C man $@
 	@$(MAKE) -C src $@
+
+clean realclean:
+	@$(MAKE) -C man $@
+	@$(MAKE) -C src $@
+
+uninstall:
+	@$(MAKE) -C src uninstall
 
 docs:
 	@$(MAKE) -C src/doc all
@@ -31,11 +42,12 @@ docs:
 docsclean:
 	@$(MAKE) -C src/doc clean
 
-$(PACKAGE_NAME).spec: $(REALTOPDIR)/$(PACKAGE_NAME).spec.in $(top_builddir)/config.status
+GIT_REV := $(shell $(REALTOPDIR)/git-rev.sh $(top_builddir))
+.LOW_RESOLUTION_TIME: $(GIT_REV)
+
+$(PACKAGE_NAME).spec: $(GIT_REV) $(REALTOPDIR)/$(PACKAGE_NAME).spec.in $(top_builddir)/config.status
 	cd $(top_builddir) && ./config.status
 
-GIT_REV := $(shell $(REALTOPDIR)/git-rev.sh)
-.LOW_RESOLUTION_TIME: $(GIT_REV)
 $(PACKETNAME).tar.gz: $(GIT_REV) $(PACKAGE_NAME).spec changelog
 	rm -f $(PACKETNAME).tar.gz
 	(cd $(REALTOPDIR); git archive -o $(abs_top_builddir)/$(PACKETNAME).tar --prefix=$(PACKETNAME)/ HEAD)
@@ -49,6 +61,7 @@ $(PACKETNAME).tar.gz: $(GIT_REV) $(PACKAGE_NAME).spec changelog
 dist: $(PACKETNAME).tar.gz
 
 rpm: $(PACKETNAME).tar.gz $(PACKAGE_NAME).spec
+	./default-configure
 	rpmbuild -tb $(PACKETNAME).tar.gz
 	rm -f $(PACKETNAME).tar.gz
 
@@ -92,6 +105,7 @@ pristine distclean mrproper:  Makefile.conf docsclean
 	rm -f gen*.log
 	rm -f config.sub config.guess
 	rm -rf 2.*
+	rm -rf autom4te.cache
 	$(REALTOPDIR)/scripts/mkpluginhooks clean
 
 tar: distclean

@@ -2214,7 +2214,7 @@ static inline int instr_sim(x86_regs *x86, int pmode)
       eip += inst_len + 2; break;
     case 0x30: /*div word*/
       if (x86->operand_size == 4) return 0;
-      und = (DX<<16) + AX;
+      und = ((uint32_t)DX<<16) + AX;
       uns = instr_read_word(mem);
       if (uns == 0) return 0;
       und2 = und / uns;
@@ -2224,7 +2224,7 @@ static inline int instr_sim(x86_regs *x86, int pmode)
       eip += inst_len + 2; break;
     case 0x38: /*idiv word*/
       if (x86->operand_size == 4) return 0;
-      i = ((short)DX<<16) + AX;
+      i = ((uint32_t)DX<<16) + AX;
       uns = instr_read_word(mem);
       if (uns == 0) return 0;
       i2 = i / (short)uns;
@@ -2237,23 +2237,23 @@ static inline int instr_sim(x86_regs *x86, int pmode)
 
   case 0xf8: /* clc */
     EFLAGS &= ~CF;
-    eip++; break;;
+    eip++; break;
 
   case 0xf9: /* stc */
     EFLAGS |= CF;
-    eip++; break;;
+    eip++; break;
 
     /* 0xfa cli 0xfb sti */
 
   case 0xfc: /* cld */
     EFLAGS &= ~DF;
     loop_inc = 1;
-    eip++; break;;
+    eip++; break;
 
   case 0xfd: /* std */
     EFLAGS |= DF;
     loop_inc = -1;
-    eip++; break;;
+    eip++; break;
 
   case 0xfe: /* inc/dec mem */
     mem = x86->modrm(MEM_BASE32(cs + eip), x86, &inst_len);
@@ -2292,7 +2292,7 @@ static inline int instr_sim(x86_regs *x86, int pmode)
       OPandFLAG0(unl, decw, uns, =r);
       EFLAGS |= unl & (OF|ZF|SF|PF|AF);
       instr_write_word(mem, uns);
-      eip += inst_len + 2; break;;
+      eip += inst_len + 2; break;
     case 0x10: /*call near*/
       push(eip + inst_len + 2, x86);
       eip = uns;

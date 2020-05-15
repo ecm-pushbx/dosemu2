@@ -66,7 +66,7 @@ static char RCSxms[] = "$Id$";
 
 static int a20_local, a20_global, freeHMA;	/* is HMA free? */
 
-static struct Handle handles[NUM_HANDLES + 1];
+static struct Handle handles[NUM_HANDLES];
 static int handle_count;
 static int intdrv;
 
@@ -167,8 +167,10 @@ static void umb_free_all(void)
 {
   int i;
 
-  for (i = 0; i < umbs_used; i++)
+  for (i = 0; i < umbs_used; i++) {
+    e_invalidate_full(DOSADDR_REL(smget_base_addr(&umbs[i])), umbs[i].size);
     smfree_all(&umbs[i]);
+  }
   umbs_used = 0;
 }
 
@@ -177,7 +179,7 @@ static void umb_free(int segbase)
   int umb = umb_find(segbase);
 
   if (umb != UMB_NULL)
-    smfree(&umbs[umb], SEG2LINEAR(segbase));
+    smfree(&umbs[umb], SEG2UNIX(segbase));
 }
 
 static int
@@ -266,7 +268,7 @@ static void xms_helper_init(void)
   if (!config.xms_size)
     return;
   handle_count = 0;
-  for (i = 0; i < NUM_HANDLES + 1; i++) {
+  for (i = 0; i < NUM_HANDLES; i++) {
     if (handles[i].valid && handles[i].addr)
       xms_free(handles[i].addr);
     handles[i].valid = 0;
@@ -580,7 +582,7 @@ FindFreeHandle(int start)
   int i, h = 0;
 
   /* first free handle is 1 */
-  for (i = start; (i <= NUM_HANDLES) && (h == 0); i++) {
+  for (i = start; (i < NUM_HANDLES) && (h == 0); i++) {
     if (!handles[i].valid) {
       x_printf("XMS: found free handle: %d\n", i);
       h = i;
@@ -595,7 +597,7 @@ FindFreeHandle(int start)
 static int
 ValidHandle(unsigned short h)
 {
-  if ((h <= NUM_HANDLES) && (handles[h].valid))
+  if ((h < NUM_HANDLES) && (handles[h].valid))
     return 1;
   else
     return 0;
@@ -608,8 +610,14 @@ xms_query_freemem(int api)
   int h;
 
   if (!config.xms_size) {
-    REG(eax) = 0;
-    REG(edx) = 0;
+    if (api == OLDXMS) {
+      LWORD(eax) = 0;
+      LWORD(edx) = 0;
+    } else {
+      REG(eax) = 0;
+      REG(edx) = 0;
+      REG(ecx) = 0;
+    }
     LO(bx) = 0;
     return 0;
   }
@@ -625,7 +633,7 @@ xms_query_freemem(int api)
    */
 
   totalBytes = 0;
-  for (h = FIRST_HANDLE; h <= NUM_HANDLES; h++) {
+  for (h = FIRST_HANDLE; h < NUM_HANDLES; h++) {
     if (ValidHandle(h))
       totalBytes += handles[h].size;
   }
@@ -659,6 +667,7 @@ xms_query_freemem(int api)
   else {
     REG(eax) = largest;
     REG(edx) = subtotal;
+    REG(ecx) = (config.xms_size * 1024 + LOWMEM_SIZE + HMASIZE) - 1;
     x_printf("XMS query free memory(new): %dK %dK\n",
 	     REG(eax), REG(edx));
   }
@@ -759,7 +768,7 @@ xms_move_EMB(void)
     src = SEGOFF2LINEAR(e.SourceOffset >> 16, e.SourceOffset & 0xffff);
   }
   else {
-    if (handles[e.SourceHandle].valid == 0) {
+    if (e.SourceHandle >= NUM_HANDLES || handles[e.SourceHandle].valid == 0) {
       x_printf("XMS: invalid source handle\n");
       return 0xa3;
     }
@@ -836,12 +845,12 @@ xms_EMB_info(int api)
 
   if (ValidHandle(h)) {
     if (api == OLDXMS) {
-      LO(bx) = NUM_HANDLES - handle_count;
+      LO(bx) = NUM_HANDLES - FIRST_HANDLE - handle_count;
       LWORD(edx) = handles[h].size / 1024;
       x_printf("XMS Get EMB info(old) %d\n", h);
     }
     else {			/* api == NEWXMS */
-      LWORD(ecx) = NUM_HANDLES - handle_count;
+      LWORD(ecx) = NUM_HANDLES - FIRST_HANDLE - handle_count;
       REG(edx) = handles[h].size / 1024;
       x_printf("XMS Get EMB info(new) %d\n", h);
     }

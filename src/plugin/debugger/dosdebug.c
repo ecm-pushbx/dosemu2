@@ -39,6 +39,8 @@
 
 int kill_timeout=FOREVER;
 
+const char *prompt = "dosdebug> ";
+
 int fdconin, fddbgin, fddbgout;
 FILE *fpconout;
 int running;
@@ -194,14 +196,28 @@ static COMMAND cmds[] = {
    "REGEX             set breakpoint on logoutput using regex\n"},
   {"bclog", NULL,
    "REGEX             clear breakpoint on logoutput using regex\n"},
-  {"rusermap", NULL,
-   "org FILE          read MS linker format .MAP file at code origin = 'org'.\n"},
-  {"rusermap", NULL,
+  {"usermap", NULL,
+   "load-ms FILE [org]   read MS linker format .MAP file at code origin = 'org'.\n"},
+  {"usermap", NULL,
+   "load-gnu FILE [org]   read Gnu ld linker format .MAP file at code origin = 'org'.\n"},
+  {"usermap", NULL,
    "list              list the currently loaded user symbols\n"},
+  {"usermap", NULL,
+   "clear             clear all user symbols\n"},
+  {"symbol", NULL,
+   "[ADDR]            Find the previous symbol to current CS:IP or ADDR\n"},
   {"ldt", NULL,
    "[sel]             dump ldt page or specific entry for selector 'sel'\n"},
   {"log", NULL,
    "[on | off | info | FLAGS ] get/set debug-log flags (e.g 'log +M-k')\n"},
+  {"mcbs", NULL,
+   "                  display MCBs by walking the chain\n"},
+  {"devs", NULL,
+   "                  display DEVICEs by walking the chain\n"},
+  {"ddrh", NULL,
+   "ADDR              display the Device Driver Request Header at ADDR\n"},
+  {"dpbs", NULL,
+   "[ADDR]            display DPBs by walking the chain from LOL or ADDR\n"},
   {"kill", db_kill,
    "                  Kill the dosemu process\n"},
   {"quit", db_quit,
@@ -342,7 +358,8 @@ static void handle_console_input(char *line)
 #endif
     snprintf(last_line, sizeof(last_line), "%s", line);
     if ((strncmp(last_line, "d ", 2) == 0) ||
-        (strncmp(last_line, "u ", 2) == 0) ){
+        (strncmp(last_line, "u ", 2) == 0) ||
+        (strncmp(last_line, "tc", 2) == 0) ){
       last_line[1] = '\0';
     }
     p = line;      // line okay to execute
@@ -386,14 +403,29 @@ static int handle_dbg_input(int *retval)
       return 0;
     }
 
-    fputs("\n", fpconout);
-    fwrite(buf, 1, n, fpconout);
-    fflush(fpconout);
 #ifdef HAVE_LIBREADLINE
-    rl_on_new_line();
+    char *saved_line;
+    int saved_point;
+    saved_point = rl_point;
+    saved_line = rl_copy_text(0, rl_end);
+    rl_set_prompt("");
+    rl_replace_line("", 0);
     rl_redisplay();
 #endif
+
+    fwrite(buf, 1, n, fpconout);
+    fputs("\n", fpconout);
+    fflush(fpconout);
+
+#ifdef HAVE_LIBREADLINE
+    rl_set_prompt(prompt);
+    rl_replace_line(saved_line, 0);
+    rl_point = saved_point;
+    rl_redisplay();
+    free(saved_line);
+#endif
   }
+
   if (n == 0) {
     *retval = 1;
     return 0;
@@ -486,7 +518,7 @@ int main (int argc, char **argv)
   rl_attempted_completion_function = db_completion;
 
   /* Install the readline handler. */
-  rl_callback_handler_install("dosdebug> ", rl_console_callback);
+  rl_callback_handler_install(prompt, rl_console_callback);
 
   fdconin = fileno(rl_instream);
   fpconout = rl_outstream;

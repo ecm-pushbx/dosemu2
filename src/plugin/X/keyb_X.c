@@ -21,6 +21,7 @@ Since this code has been totally rewritten the pcemu license no longer applies
 ***********************************************************************
 */
 
+#include <limits.h>
 #include <X11/X.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -125,11 +126,15 @@ static void X_modifier_info_init(Display *display)
 	XFreeModifiermap(map);
 }
 
-void keyb_X_init(Display *display)
+static int keyb_X_init(void)
 {
+	if (!display)
+		return 0;
 	X_modifier_info_init(display);
 	init_charset_state(&X_charset, lookup_charset("X_keysym"));
+	config.X_keycode = 1;
 	initialized = 1;
+	return 1;
 }
 
 static int use_move_key(t_keysym key)
@@ -262,6 +267,7 @@ void X_process_keys(XKeymapEvent *e)
 void map_X_event(Display *display, XKeyEvent *e, struct mapped_X_event *result)
 {
 	KeySym xkey;
+	t_unicode key;
 	unsigned int modifiers;
 	/* modifiers should be set to the (currently active) modifiers that were not used
 	 * to generate the X KeySym.  This allows for cases like Ctrl-A to be generate
@@ -292,10 +298,11 @@ void map_X_event(Display *display, XKeyEvent *e, struct mapped_X_event *result)
 		modifiers = e->state & (~modifiers);
 	}
 #endif
-	charset_to_unicode(&X_charset, &result->key,
+	charset_to_unicode(&X_charset, &key,
 		(const unsigned char *)&xkey, sizeof(xkey));
 	result->make = (e->type == KeyPress);
 	result->modifiers = map_X_modifiers(modifiers);
+	result->key = key;
 	X_printf("X: key_event: %02x %08x %8s sym: %04x -> %04x %08x\n",
 		e->keycode,
 		e->state,
@@ -305,18 +312,7 @@ void map_X_event(Display *display, XKeyEvent *e, struct mapped_X_event *result)
 		result->modifiers);
 }
 
-#if HAVE_XKB
-t_unicode Xkb_lookup_key(Display *display, KeyCode keycode, unsigned int state)
-{
-	t_unicode key;
-	KeySym xkey = XK_VoidSymbol;
-	unsigned int modifiers = 0;
-	XkbLookupKeySym(display, keycode, state, &modifiers, &xkey);
-	charset_to_unicode(&X_charset, &key,
-		(const unsigned char *)&xkey, sizeof(xkey));
-	return key;
-}
-
+#if 0
 int Xkb_get_group(Display *display, unsigned int *mods)
 {
 	XkbStateRec r;
@@ -331,16 +327,7 @@ void X_process_key(Display *display, XKeyEvent *e)
 {
 	struct mapped_X_event event;
 
-	if (!initialized) {
-		keyb_X_init(display);
-		initialized = 1;
-	}
-	if (config.X_keycode) {
-		X_keycode_process_key(display, e);
-		return;
-	}
 	map_X_event(display, e, &event);
-
 	X_sync_shiftstate(event.make, e->keycode, e->state);
 	/* If the key is just a ``function'' key just wiggle the key
 	 * with the appropriate keysym in the dos keyboard layout.
@@ -367,7 +354,7 @@ static int probe_X_keyb(void)
 struct keyboard_client Keyboard_X =  {
 	"X11",			/* name */
 	probe_X_keyb,		/* probe */
-	NULL,			/* init */
+	keyb_X_init,		/* init */
 	NULL,			/* reset */
 	NULL,			/* close */
 	NULL,			/* set_leds */

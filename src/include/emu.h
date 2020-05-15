@@ -98,8 +98,8 @@ void dos_ctrl_alt_del(void);	/* disabled */
 
 extern void vm86_helper(void);
 extern void loopstep_run_vm86(void);
-extern void do_call_back(Bit16u cs, Bit16u ip);
-extern void do_int_call_back(int intno);
+extern int do_call_back(Bit16u cs, Bit16u ip);
+extern int do_int_call_back(int intno);
 
 void getKeys(void);
 
@@ -144,6 +144,11 @@ typedef struct vesamode_type_struct {
 typedef struct config_info {
        int hdiskboot;
        boolean swap_bootdrv;
+       boolean alt_drv_c;
+       uint8_t drive_c_num;
+       uint32_t drives_mask;
+       int try_freedos;
+       int boot_freedos;
 
 #ifdef X86_EMULATOR
        int cpuemu;
@@ -215,6 +220,7 @@ typedef struct config_info {
        char   *vdeswitch;
        char   *slirp_args;
        boolean pktdrv;
+       boolean ne2k;
        boolean dosbanner;
        boolean emuretrace;
        boolean rdtsc;
@@ -229,14 +235,13 @@ typedef struct config_info {
 
        int  fastfloppy;
        char *emusys;		/* map CONFIG.SYS to CONFIG.EMU */
-       const char *install;	/* directory to point ~/.dosemu/drives/c to */
-       boolean default_drives;
 
        u_short speaker;		/* 0 off, 1 native, 2 emulated */
        u_short fdisks, hdisks;
        u_short num_lpt;
        u_short num_ser;
        mouse_t mouse;
+       int num_serial_mices;
 
        int pktflags;		/* global flags for packet driver */
 
@@ -256,8 +261,11 @@ typedef struct config_info {
        int sillyint;            /* IRQ numbers for Silly Interrupt Generator
        				   (bitmask, bit3..15 ==> IRQ3 .. IRQ15) */
 
+       int layout;
        struct keytable_entry *keytable;
        struct keytable_entry *altkeytable;
+       const char *internal_cset;
+       const char *external_cset;
 
        unsigned short detach;
        char *debugout;
@@ -271,7 +279,11 @@ typedef struct config_info {
 
        /* LFN support */
        boolean lfn;
+       int int_hooks;
+       int force_revect;
        boolean force_redir;
+
+       boolean dos_trace;	/* SWITCHES=/Y */
 
        /* type of mapping driver */
        char *mappingdriver;
@@ -448,7 +460,6 @@ extern void cdrom_helper(unsigned char *, unsigned char *, unsigned int);
 extern int mscdex(void);
 extern void boot(void);
 extern void do_liability_disclaimer_prompt(int prompt);
-extern void install_dos(void);
 extern int ipx_int7a(void);
 extern void read_next_scancode_from_queue (void);
 extern unsigned short detach (void);
@@ -458,6 +469,8 @@ extern void HMA_init(void);
 extern void HMA_MAP(int HMA);
 extern void hardware_run(void);
 extern int register_exit_handler(void (*handler)(void));
+void set_external_charset(const char *charset_name);
+void set_internal_charset(const char *charset_name);
 
 extern const char *Path_cdrom[];
 
